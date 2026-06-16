@@ -40,5 +40,6 @@ int sys_open(char* path, mode_t mode);
 int sys_userfaultfd(int flags);
 int sys_ioctl(int fd, unsigned long cmd, unsigned long arg);
 int sys_sendmsg(int fd, struct msghdr *msg, int flags);
+int sys_recvmsg(int fd, struct msghdr *msg, int flags);
 
 #endif

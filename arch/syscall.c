@@ -148,3 +148,8 @@ int sys_sendmsg(int fd, struct msghdr *msg, int flags)
 	return syscall3(__NR_sendmsg, fd, (unsigned long)msg, flags);
 }
 
+int sys_recvmsg(int fd, struct msghdr *msg, int flags)
+{
+	return syscall3(__NR_recvmsg, fd, (unsigned long)msg, flags);
+}
+
