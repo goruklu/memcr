@@ -58,7 +58,7 @@ memcr [-h] [-p PID] [-d DIR] [-S DIR] [-G gid] [-N] [-l PORT|PATH] [-g gid] [-n]
 options:
   -h --help             help
   -p --pid              target process pid
-  -d --dir              dir where memory dump is stored (defaults to /tmp)
+  -d --dir              dir/dirs where memory dump can be stored (defaults to /tmp. Separated by ';')
   -S --parasite-socket-dir      dir where socket to communicate with parasite is created
         (abstract socket will be used if no path specified)
   -G --parasite-socket-gid      group ID for parasite UNIX domain socket file, valid only for if --parasite-socket-dir provided
@@ -90,6 +90,12 @@ memcr client:
 memcr-client -l 9000 -p 1234567 --checkpoint
 memcr-client -l 9000 -p 1234567 --restore
 ```
+The client uses a v2 protocol by default that supports per-PID dump directory and compression options:
+```
+memcr-client -l 9000 -p 1234567 --checkpoint -d /mnt/fast -z zstd
+memcr-client -l 9000 -p 1234567 --restore
+```
+Use `--v1` to force the legacy protocol if the server does not support v2.
 Due to high priviledges of the memcr daemon it is recommended to run memcr daemon process as non-root user with elevated Linux capabilities and permissions, the details are described in: [doc/security_considerations.md](doc/security_considerations.md)
 
 #### lazy page restore
