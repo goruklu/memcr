@@ -206,11 +206,11 @@ static int cmd_set_pages(const int cd)
 	return 0;
 }
 
-static int recv_fd(int cd)
+static int send_fd(int cd, int fd_to_send)
 {
 	struct msghdr msg;
 	struct iovec iov;
-	char buf[1];
+	char buf[1] = {0};
 	char cmsg_buf[sizeof(struct cmsghdr) + sizeof(int)] __attribute__((aligned(sizeof(long))));
 	struct cmsghdr *cmsg;
 	int *fdptr;
@@ -227,36 +227,52 @@ static int recv_fd(int cd)
 	msg.msg_controllen = sizeof(cmsg_buf);
 	msg.msg_flags = 0;
 
-	ret = sys_recvmsg(cd, &msg, 0);
+	cmsg = (struct cmsghdr *)cmsg_buf;
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = sizeof(cmsg_buf);
+
+	fdptr = (int *)((char *)cmsg + sizeof(struct cmsghdr));
+	*fdptr = fd_to_send;
+
+	ret = sys_sendmsg(cd, &msg, 0);
 	if (ret < 0)
 		return -1;
 
-	cmsg = (struct cmsghdr *)cmsg_buf;
-	if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
-		return -1;
-
-	fdptr = (int *)((char *)cmsg + sizeof(struct cmsghdr));
-	return *fdptr;
+	return 0;
 }
 
 static int cmd_setup_uffd(const int cd)
 {
 	int ret;
 	int uffd;
+	struct uffdio_api api;
 	struct uffdio_register reg;
 	struct uffd_region_req req;
 	int failed = 0;
-	char status;
 
-	/*
-	 * Receive userfaultfd from daemon via SCM_RIGHTS.
-	 * The daemon creates the uffd (privileged) and sends it to us
-	 * so we can call UFFDIO_REGISTER in our address space.
-	 */
-	uffd = recv_fd(cd);
+	/* Create userfaultfd in the target process context */
+	uffd = sys_userfaultfd(O_NONBLOCK | O_CLOEXEC);
 	if (uffd < 0) {
-		print(2, "recv_fd() failed\n");
+		print(2, "sys_userfaultfd() failed: ");
+		print(2, ulong_to_hstr(uffd));
+		print(2, "\n");
 		failed = 1;
+	}
+
+	/* Negotiate API */
+	if (!failed) {
+		api.api = UFFD_API;
+		api.features = 0;
+		api.ioctls = 0;
+		ret = sys_ioctl(uffd, UFFDIO_API, (unsigned long)&api);
+		if (ret < 0) {
+			print(2, "UFFDIO_API failed: ");
+			print(2, ulong_to_hstr(ret));
+			print(2, "\n");
+			sys_close(uffd);
+			failed = 1;
+		}
 	}
 
 	/*
@@ -279,21 +295,20 @@ static int cmd_setup_uffd(const int cd)
 				print(2, "UFFDIO_REGISTER failed: ");
 				print(2, ulong_to_hstr(ret));
 				print(2, "\n");
+				sys_close(uffd);
 				failed = 1;
 			}
 		}
 	}
 
-	/* Send status back to daemon: 0 = success, 1 = failure */
-	status = failed ? 1 : 0;
-	sys_write(cd, &status, 1);
+	if (failed)
+		return -1;
 
-	if (failed && uffd >= 0)
-		sys_close(uffd);
-	else if (!failed)
-		sys_close(uffd);
+	/* Send uffd back to daemon via SCM_RIGHTS */
+	ret = send_fd(cd, uffd);
+	sys_close(uffd);
 
-	return failed ? -1 : 0;
+	return ret < 0 ? -1 : 0;
 }
 
 static int cmd_end(const int cd)

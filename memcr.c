@@ -51,9 +51,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/prctl.h>
-#include <sys/ioctl.h>
-#include <sys/syscall.h>
-#include <linux/userfaultfd.h>
 #include <limits.h>
 
 #include "compress.h"
@@ -2036,11 +2033,11 @@ static int cmd_restore(pid_t pid)
 	return 0;
 }
 
-static int send_fd(int cd, int fd_to_send)
+static int recv_fd(int cd)
 {
 	struct msghdr msg;
 	struct iovec iov;
-	char buf[1] = {0};
+	char buf[1];
 	char cmsg_buf[CMSG_SPACE(sizeof(int))];
 	struct cmsghdr *cmsg;
 	int ret;
@@ -2054,19 +2051,22 @@ static int send_fd(int cd, int fd_to_send)
 	msg.msg_control = cmsg_buf;
 	msg.msg_controllen = sizeof(cmsg_buf);
 
-	cmsg = CMSG_FIRSTHDR(&msg);
-	cmsg->cmsg_level = SOL_SOCKET;
-	cmsg->cmsg_type = SCM_RIGHTS;
-	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-	memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(fd_to_send));
-
-	ret = sendmsg(cd, &msg, 0);
+	ret = recvmsg(cd, &msg, 0);
 	if (ret < 0) {
-		err("send_fd: sendmsg failed: %m\n");
+		err("recv_fd: recvmsg failed: %m\n");
 		return -1;
 	}
 
-	return 0;
+	cmsg = CMSG_FIRSTHDR(&msg);
+	if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+	    cmsg->cmsg_type != SCM_RIGHTS) {
+		err("recv_fd: no SCM_RIGHTS in message\n");
+		return -1;
+	}
+
+	int fd;
+	memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
+	return fd;
 }
 
 static int setup_target_uffd(pid_t pid, struct vm_area *target_vmas, int target_nr_vmas)
@@ -2077,66 +2077,21 @@ static int setup_target_uffd(pid_t pid, struct vm_area *target_vmas, int target_
 	int i;
 	unsigned long pc_page = (unsigned long)ctx.pc & ~((unsigned long)page_size - 1);
 	unsigned long sp_page = (unsigned long)ctx.sp & ~((unsigned long)page_size - 1);
-	struct uffdio_api api;
-	char status;
-
-	/*
-	 * Create userfaultfd in the daemon process (which runs as root).
-	 * This avoids permission issues when the target process is
-	 * unprivileged and vm.unprivileged_userfaultfd is disabled.
-	 */
-	uffd = syscall(__NR_userfaultfd, O_NONBLOCK | O_CLOEXEC);
-	if (uffd < 0) {
-		err("setup_target_uffd: userfaultfd() failed: %m\n");
-		return -1;
-	}
-
-	/* Negotiate API */
-	api.api = UFFD_API;
-	api.features = 0;
-	api.ioctls = 0;
-	ret = ioctl(uffd, UFFDIO_API, &api);
-	if (ret < 0) {
-		err("setup_target_uffd: UFFDIO_API failed: %m\n");
-		close(uffd);
-		return -1;
-	}
 
 	/*
 	 * Connect to parasite and send CMD_SETUP_UFFD.
-	 * The parasite will receive the uffd and call UFFDIO_REGISTER
-	 * for each VMA range (must be done in-process).
+	 * The parasite creates the userfaultfd inside the target process
+	 * (the uffd is bound to the creator's mm), does UFFDIO_API and
+	 * UFFDIO_REGISTER, then sends the uffd back to us via SCM_RIGHTS.
 	 */
 	cd = parasite_connect(pid);
-	if (cd < 0) {
-		close(uffd);
+	if (cd < 0)
 		return -1;
-	}
 
 	ret = parasite_write(cd, &(char){CMD_SETUP_UFFD}, 1);
 	if (ret != 1) {
 		err("setup_target_uffd: failed to send CMD_SETUP_UFFD\n");
 		close(cd);
-		close(uffd);
-		return -1;
-	}
-
-	/*
-	 * Switch socket to blocking mode for sendmsg/recvmsg.
-	 * parasite_connect() creates the socket with SOCK_NONBLOCK.
-	 */
-	{
-		int flags = fcntl(cd, F_GETFL, 0);
-		if (flags >= 0)
-			fcntl(cd, F_SETFL, flags & ~O_NONBLOCK);
-	}
-
-	/* Send uffd to parasite via SCM_RIGHTS */
-	ret = send_fd(cd, uffd);
-	if (ret < 0) {
-		err("setup_target_uffd: failed to send uffd to parasite\n");
-		close(cd);
-		close(uffd);
 		return -1;
 	}
 
@@ -2172,7 +2127,6 @@ static int setup_target_uffd(pid_t pid, struct vm_area *target_vmas, int target_
 			if (ret != sizeof(req)) {
 				err("setup_target_uffd: failed to send VMA range\n");
 				close(cd);
-				close(uffd);
 				return -1;
 			}
 		}
@@ -2181,18 +2135,28 @@ static int setup_target_uffd(pid_t pid, struct vm_area *target_vmas, int target_
 	/* Signal end of VMA list */
 	shutdown(cd, SHUT_WR);
 
-	/* Wait for parasite to confirm registration success/failure */
-	ret = _read(cd, &status, 1);
+	/*
+	 * Switch socket to blocking mode for recvmsg.
+	 * parasite_connect() creates the socket with SOCK_NONBLOCK,
+	 * but we need to block here waiting for the parasite to
+	 * send the uffd back via SCM_RIGHTS.
+	 */
+	{
+		int flags = fcntl(cd, F_GETFL, 0);
+		if (flags >= 0)
+			fcntl(cd, F_SETFL, flags & ~O_NONBLOCK);
+	}
+
+	/* Receive the uffd via SCM_RIGHTS */
+	uffd = recv_fd(cd);
 	close(cd);
 
-	if (ret != 1 || status != 0) {
-		err("setup_target_uffd: parasite registration failed (status=%d)\n",
-		    ret == 1 ? status : -1);
-		close(uffd);
+	if (uffd < 0) {
+		err("setup_target_uffd: failed to receive uffd from parasite\n");
 		return -1;
 	}
 
-	log("setup_target_uffd: uffd %d ready, registration complete\n", uffd);
+	log("setup_target_uffd: received uffd %d\n", uffd);
 	return uffd;
 }
 
