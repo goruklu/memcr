@@ -2215,7 +2215,12 @@ static int cmd_restore_lazy(pid_t pid)
 	uffd = setup_target_uffd(pid, vmas, nr_vmas);
 	if (uffd < 0) {
 		err("lazy restore: uffd setup failed, falling back to eager restore\n");
-		return cmd_restore(pid);
+		/*
+		 * Return negative to signal that we fell back to eager restore.
+		 * The caller must not enter the lazy-pages post-processing path.
+		 */
+		ret = cmd_restore(pid);
+		return ret ? ret : -2;
 	}
 
 	/* Restore memory protections */
@@ -2647,6 +2652,14 @@ static int execute_parasite_restore(pid_t pid)
 
 	if (lazy_pages) {
 		err = cmd_restore_lazy(pid);
+		if (err == -2) {
+			/*
+			 * Lazy restore fell back to eager restore successfully.
+			 * cmd_restore() already handled the full restore path
+			 * including parasite termination, so we're done.
+			 */
+			return 0;
+		}
 		if (err) {
 			err("cmd_restore_lazy() failed: %d\n", err);
 			return err;
