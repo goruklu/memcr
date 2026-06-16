@@ -58,6 +58,13 @@ void page_index_destroy(struct page_index *idx)
 	if (!idx)
 		return;
 
+	if (idx->preloaded) {
+		int i;
+		for (i = 0; i < idx->nr_entries; i++) {
+			free(idx->entries[i].data);
+		}
+	}
+
 	free(idx->entries);
 	free(idx);
 }
@@ -85,6 +92,7 @@ int page_index_add(struct page_index *idx, unsigned long addr, unsigned long len
 	entry->len = len;
 	entry->file_offset = file_offset;
 	entry->on_disk_len = on_disk_len;
+	entry->data = NULL;
 	entry->served = 0;
 
 	idx->nr_entries++;
@@ -117,24 +125,29 @@ static int cmp_entries_by_addr(const void *a, const void *b)
  * When compressed=0 (plain):
  *   [raw page data (vm_region.len bytes)]
  *
- * The file_offset recorded in each index entry points to the START of the
- * data payload (right after the vm_region header). This is where compress_read()
- * should begin reading from.
+ * When encrypted=1, the file must be read strictly sequentially via read_fn
+ * (no lseek allowed). Page data is decompressed and stored in memory for
+ * later retrieval (preloaded mode).
+ *
+ * When encrypted=0, file_offset is recorded for later lseek+read during
+ * fault resolution.
  */
 int page_index_build(struct page_index *idx, int dump_fd,
 		     int (*read_fn)(int fd, void *buf, size_t count),
-		     int compressed)
+		     int compressed, int encrypted,
+		     int (*decompress_fn)(char *dst, const size_t len,
+					  int (*xread)(int fd, void *buf, size_t count),
+					  int fd))
 {
 	struct vm_region vmr;
 	off_t data_offset;
 	unsigned long on_disk_len;
 	int ret;
+	/* Scratch buffer for skipping compressed data in non-encrypted mode */
+	char skip_buf[4096];
 
-	/* Seek to beginning of dump file */
-	if (lseek(dump_fd, 0, SEEK_SET) < 0) {
-		err("page_index_build: lseek to start failed\n");
-		return -1;
-	}
+	/* Seek to beginning of dump file (works even for encrypted files at start) */
+	lseek(dump_fd, 0, SEEK_SET);
 
 	while (1) {
 		/* Read vm_region header */
@@ -147,52 +160,78 @@ int page_index_build(struct page_index *idx, int dump_fd,
 			return -1;
 		}
 
-		/* Record position of data payload */
-		data_offset = lseek(dump_fd, 0, SEEK_CUR);
-		if (data_offset < 0) {
-			err("page_index_build: lseek for data offset failed\n");
-			return -1;
-		}
-
-		if (compressed) {
+		if (encrypted) {
 			/*
-			 * Read the uint32_t compressed length prefix to know
-			 * how much data to skip.
+			 * Encrypted mode: read and decompress data now,
+			 * store it in memory for later use.
 			 */
-			uint32_t comp_len;
-			ret = read_fn(dump_fd, &comp_len, sizeof(comp_len));
-			if (ret != (int)sizeof(comp_len)) {
-				err("page_index_build: failed to read compressed length\n");
+			char *page_data = malloc(vmr.len);
+			if (!page_data) {
+				err("page_index_build: malloc(%lu) failed\n", vmr.len);
 				return -1;
 			}
-			on_disk_len = sizeof(comp_len) + comp_len;
 
-			/* Skip past the compressed data */
-			if (lseek(dump_fd, comp_len, SEEK_CUR) < 0) {
-				err("page_index_build: lseek past compressed data failed\n");
+			ret = decompress_fn(page_data, vmr.len, read_fn, dump_fd);
+			if (ret < 0) {
+				err("page_index_build: decompress failed for region %lx\n", vmr.addr);
+				free(page_data);
 				return -1;
 			}
+
+			ret = page_index_add(idx, vmr.addr, vmr.len, 0, 0);
+			if (ret < 0) {
+				free(page_data);
+				return -1;
+			}
+
+			/* Store the decompressed data pointer in the entry */
+			idx->entries[idx->nr_entries - 1].data = page_data;
 		} else {
-			/* Plain mode: data is exactly vmr.len bytes */
-			on_disk_len = vmr.len;
-
-			if (lseek(dump_fd, vmr.len, SEEK_CUR) < 0) {
-				err("page_index_build: lseek past raw data failed\n");
+			/* Non-encrypted: record file offset, skip data */
+			data_offset = lseek(dump_fd, 0, SEEK_CUR);
+			if (data_offset < 0) {
+				err("page_index_build: lseek for data offset failed\n");
 				return -1;
 			}
-		}
 
-		ret = page_index_add(idx, vmr.addr, vmr.len, data_offset, on_disk_len);
-		if (ret < 0) {
-			err("page_index_build: page_index_add failed\n");
-			return -1;
+			if (compressed) {
+				uint32_t comp_len;
+				ret = read_fn(dump_fd, &comp_len, sizeof(comp_len));
+				if (ret != (int)sizeof(comp_len)) {
+					err("page_index_build: failed to read compressed length\n");
+					return -1;
+				}
+				on_disk_len = sizeof(comp_len) + comp_len;
+
+				/* Skip past compressed data */
+				if (lseek(dump_fd, comp_len, SEEK_CUR) < 0) {
+					err("page_index_build: lseek past compressed data failed\n");
+					return -1;
+				}
+			} else {
+				on_disk_len = vmr.len;
+				if (lseek(dump_fd, vmr.len, SEEK_CUR) < 0) {
+					err("page_index_build: lseek past raw data failed\n");
+					return -1;
+				}
+			}
+
+			ret = page_index_add(idx, vmr.addr, vmr.len, data_offset, on_disk_len);
+			if (ret < 0) {
+				err("page_index_build: page_index_add failed\n");
+				return -1;
+			}
 		}
 	}
+
+	if (encrypted)
+		idx->preloaded = 1;
 
 	/* Sort entries by address for binary search */
 	qsort(idx->entries, idx->nr_entries, sizeof(struct page_index_entry),
 	      cmp_entries_by_addr);
 
+	(void)skip_buf; /* suppress unused warning */
 	return 0;
 }
 

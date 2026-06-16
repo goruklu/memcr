@@ -50,13 +50,21 @@
  * Read a region's data from the dump file at the given offset,
  * decompress it into page_buf.
  *
+ * If the index is preloaded (encrypted mode), data is already in memory.
+ *
  * Returns 0 on success, -1 on error.
  */
 static int read_region_data(struct lazy_pages_ctx *ctx, struct page_index_entry *entry)
 {
 	int ret;
 
-	/* Seek to the data payload in the dump file */
+	/* Preloaded mode (encrypted): data is already decompressed in entry->data */
+	if (entry->data) {
+		memcpy(ctx->page_buf, entry->data, entry->len);
+		return 0;
+	}
+
+	/* Non-encrypted: seek and decompress from file */
 	if (lseek(ctx->dump_fd, entry->file_offset, SEEK_SET) < 0) {
 		err("lazy-pages: lseek to offset %ld failed: %m\n",
 		    (long)entry->file_offset);

@@ -26,6 +26,7 @@ struct page_index_entry {
 	unsigned long len;		/* decompressed length of region */
 	off_t file_offset;		/* offset to data payload in dump file */
 	unsigned long on_disk_len;	/* size of data on disk (compressed or raw) */
+	char *data;			/* preloaded page data (encrypted mode only) */
 	int served;			/* 1 if this region has been served */
 };
 
@@ -35,6 +36,7 @@ struct page_index {
 	int capacity;
 	unsigned long total_pages;	/* total number of pages across all entries */
 	unsigned long served_pages;	/* number of pages already served */
+	int preloaded;			/* 1 if data is preloaded in memory */
 };
 
 struct page_index *page_index_create(void);
@@ -43,7 +45,10 @@ int page_index_add(struct page_index *idx, unsigned long addr, unsigned long len
 		   off_t file_offset, unsigned long on_disk_len);
 int page_index_build(struct page_index *idx, int dump_fd,
 		     int (*read_fn)(int fd, void *buf, size_t count),
-		     int compressed);
+		     int compressed, int encrypted,
+		     int (*decompress_fn)(char *dst, const size_t len,
+					  int (*xread)(int fd, void *buf, size_t count),
+					  int fd));
 struct page_index_entry *page_index_lookup(struct page_index *idx, unsigned long addr);
 struct page_index_entry *page_index_next_unserved(struct page_index *idx);
 void page_index_mark_served(struct page_index *idx, struct page_index_entry *entry);

@@ -2166,7 +2166,8 @@ static int cmd_restore_lazy(pid_t pid)
 		return -1;
 	}
 
-	ret = page_index_build(index, dump_fd, dump_read, compress != NULL);
+	ret = page_index_build(index, dump_fd, dump_read, compress != NULL,
+			       lib__read != NULL, compress_read);
 	if (ret < 0) {
 		err("lazy restore: page_index_build failed\n");
 		page_index_destroy(index);
@@ -2643,9 +2644,15 @@ static int execute_parasite_restore(pid_t pid)
 					}
 
 					if (in_excluded_vma) {
-						lseek(lazy_ctx.dump_fd, entry->file_offset, SEEK_SET);
-						if (compress_read(buf, entry->len, lazy_ctx.dump_read, lazy_ctx.dump_fd) > 0) {
-							pwrite(mem_fd, buf, entry->len, entry->addr);
+						if (entry->data) {
+							/* Preloaded (encrypted): data is in memory */
+							pwrite(mem_fd, entry->data, entry->len, entry->addr);
+						} else {
+							/* Non-encrypted: seek and read from file */
+							lseek(lazy_ctx.dump_fd, entry->file_offset, SEEK_SET);
+							if (compress_read(buf, entry->len, lazy_ctx.dump_read, lazy_ctx.dump_fd) > 0) {
+								pwrite(mem_fd, buf, entry->len, entry->addr);
+							}
 						}
 						page_index_mark_served(lazy_ctx.index, entry);
 					}
