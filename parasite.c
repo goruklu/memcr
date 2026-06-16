@@ -249,33 +249,60 @@ static int cmd_setup_uffd(const int cd)
 	struct uffdio_api api;
 	struct uffdio_register reg;
 	struct uffd_region_req req;
+	int failed = 0;
 
 	/* Create userfaultfd */
 	uffd = sys_userfaultfd(O_NONBLOCK | O_CLOEXEC);
-	if (uffd < 0)
-		die("sys_userfaultfd() failed: ", uffd);
+	if (uffd < 0) {
+		print(2, "sys_userfaultfd() failed: ");
+		print(2, ulong_to_hstr(uffd));
+		print(2, "\n");
+		failed = 1;
+	}
 
 	/* Negotiate API */
-	api.api = UFFD_API;
-	api.features = 0;
-	api.ioctls = 0;
-	ret = sys_ioctl(uffd, UFFDIO_API, (unsigned long)&api);
-	if (ret < 0)
-		die("UFFDIO_API failed: ", ret);
+	if (!failed) {
+		api.api = UFFD_API;
+		api.features = 0;
+		api.ioctls = 0;
+		ret = sys_ioctl(uffd, UFFDIO_API, (unsigned long)&api);
+		if (ret < 0) {
+			print(2, "UFFDIO_API failed: ");
+			print(2, ulong_to_hstr(ret));
+			print(2, "\n");
+			sys_close(uffd);
+			failed = 1;
+		}
+	}
 
-	/* Register each VMA range sent by the daemon */
+	/*
+	 * Read all VMA ranges from the daemon regardless of success/failure.
+	 * The daemon sends ranges terminated by shutdown(SHUT_WR) causing
+	 * EOF on our read. We must drain the list to keep the protocol in
+	 * sync.
+	 */
 	while (1) {
 		ret = read(cd, &req, sizeof(req));
 		if (ret == 0)
 			break;
 
-		reg.range.start = req.addr;
-		reg.range.len = req.len;
-		reg.mode = UFFDIO_REGISTER_MODE_MISSING;
-		ret = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long)&reg);
-		if (ret < 0)
-			die("UFFDIO_REGISTER failed: ", ret);
+		if (!failed) {
+			reg.range.start = req.addr;
+			reg.range.len = req.len;
+			reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+			ret = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long)&reg);
+			if (ret < 0) {
+				print(2, "UFFDIO_REGISTER failed: ");
+				print(2, ulong_to_hstr(ret));
+				print(2, "\n");
+				sys_close(uffd);
+				failed = 1;
+			}
+		}
 	}
+
+	if (failed)
+		return -1;
 
 	/* Send uffd back to daemon via SCM_RIGHTS */
 	send_fd(cd, uffd);
