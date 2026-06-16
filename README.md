@@ -105,16 +105,18 @@ By default, memcr restores all checkpointed pages back into the target process b
 This reduces the time the target process is frozen during restore -- only the checkpoint (download) phase blocks the process, while pages are uploaded lazily after the process resumes.
 
 How it works:
-1. During restore, a parasite running inside the target creates a `userfaultfd` and registers eligible VMAs (anonymous private mappings) for missing-page fault tracking
-2. The uffd file descriptor is sent to the memcr daemon via `SCM_RIGHTS`
+1. The memcr daemon (running as root) creates a `userfaultfd` and sends it to the parasite inside the target process via `SCM_RIGHTS`
+2. The parasite registers eligible VMAs (anonymous private mappings) for missing-page fault tracking via `UFFDIO_REGISTER`
 3. Stack and instruction pointer VMAs are excluded from uffd and restored eagerly (required for correct process resumption)
 4. The process resumes immediately
 5. A handler thread in the daemon polls the uffd for page faults, reads the corresponding page data from the dump file, and injects it via `UFFDIO_COPY`
 6. Idle time is used to prefetch remaining pages in the background
 
+If `userfaultfd` is not available (kernel lacks `CONFIG_USERFAULTFD`), memcr automatically falls back to eager restore.
+
 Lazy-pages works with all dump configurations: plain, compressed (lz4/zstd), encrypted, and combined. Encrypted dumps are preloaded into memory at restore time since AES-CBC does not support random-access reads.
 
-Requirements: Linux kernel >= 4.11
+Requirements: Linux kernel with `CONFIG_USERFAULTFD=y` (>= 4.11). The memcr daemon must run as root.
 
 ```
 memcr -p <pid> -n --lazy-pages
