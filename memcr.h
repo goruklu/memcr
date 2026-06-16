@@ -51,6 +51,7 @@ typedef enum {
 	CMD_GET_PAGES,
 	CMD_SET_PAGES,
 	CMD_END,
+	CMD_SETUP_UFFD,
 } memcr_cmd;
 
 struct vm_mprotect {
@@ -94,6 +95,11 @@ struct target_context {
 	unsigned long stack[16];
 	uint64_t sigset;
 	unsigned long *blob;
+};
+
+struct uffd_region_req {
+	unsigned long addr;
+	unsigned long len;
 };
 
 #endif

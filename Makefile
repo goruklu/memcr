@@ -155,10 +155,16 @@ $(B)/cpu.o: arch/$(ARCH)/cpu.c
 $(B)/compress.o: compress.c compress.h
 	$(CC) $(MCFLAGS) -c $< -o $@
 
+$(B)/page-index.o: page-index.c page-index.h memcr.h
+	$(CC) $(MCFLAGS) -c $< -o $@
+
+$(B)/lazy-pages.o: lazy-pages.c lazy-pages.h page-index.h memcr.h compress.h
+	$(CC) $(MCFLAGS) -c $< -o $@
+
 $(B)/memcr.o: memcr.c $(B)/parasite-blob.h
 	$(CC) $(MCFLAGS) -DGIT_VERSION='"$(GIT_VERSION)"' -DARCH_NAME='"$(ARCH)"' -I$(B) -c $< -o $@
 
-$(B)/memcr: $(B)/memcr.o $(B)/cpu.o $(B)/enter.o $(B)/compress.o
+$(B)/memcr: $(B)/memcr.o $(B)/cpu.o $(B)/enter.o $(B)/compress.o $(B)/page-index.o $(B)/lazy-pages.o
 	$(CC) $(MCFLAGS) $^ $(LDFLAGS) -o $@
 	@stat -c "-> %n: %s bytes <-" $@
 	@size $@

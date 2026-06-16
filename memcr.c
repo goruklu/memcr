@@ -68,6 +68,8 @@
 #include "arch/cpu.h"
 #include "arch/enter.h"
 #include "parasite-blob.h"
+#include "page-index.h"
+#include "lazy-pages.h"
 
 // --- LOGGING SYSTEM CONFIGURATION ---
 #ifndef LOG_LEVEL
@@ -166,6 +168,7 @@ static char *compress;
 static int checksum;
 static int service;
 static unsigned int timeout;
+static int lazy_pages;
 
 static unsigned int page_size;
 
@@ -1995,6 +1998,197 @@ static int cmd_restore(pid_t pid)
 	return 0;
 }
 
+static int recv_fd(int cd)
+{
+	struct msghdr msg;
+	struct iovec iov;
+	char buf[1];
+	char cmsg_buf[CMSG_SPACE(sizeof(int))];
+	struct cmsghdr *cmsg;
+	int ret;
+
+	iov.iov_base = buf;
+	iov.iov_len = 1;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = cmsg_buf;
+	msg.msg_controllen = sizeof(cmsg_buf);
+
+	ret = recvmsg(cd, &msg, 0);
+	if (ret < 0) {
+		err("recv_fd: recvmsg failed: %m\n");
+		return -1;
+	}
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+	    cmsg->cmsg_type != SCM_RIGHTS) {
+		err("recv_fd: no SCM_RIGHTS in message\n");
+		return -1;
+	}
+
+	int fd;
+	memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
+	return fd;
+}
+
+static int setup_target_uffd(pid_t pid, struct vm_area *target_vmas, int target_nr_vmas)
+{
+	int cd;
+	int uffd;
+	int ret;
+	int i;
+
+	cd = parasite_connect(pid);
+	if (cd < 0)
+		return -1;
+
+	ret = parasite_write(cd, &(char){CMD_SETUP_UFFD}, 1);
+	if (ret != 1) {
+		err("setup_target_uffd: failed to send CMD_SETUP_UFFD\n");
+		close(cd);
+		return -1;
+	}
+
+	/* Send VMA ranges to register (only anonymous private mappings) */
+	for (i = 0; i < target_nr_vmas; i++) {
+		if (target_vmas[i].flags == FLAG_ANON ||
+		    target_vmas[i].flags == FLAG_STACK ||
+		    target_vmas[i].flags == FLAG_HEAP) {
+			struct uffd_region_req req = {
+				.addr = target_vmas[i].start,
+				.len = target_vmas[i].end - target_vmas[i].start,
+			};
+			ret = parasite_write(cd, &req, sizeof(req));
+			if (ret != sizeof(req)) {
+				err("setup_target_uffd: failed to send VMA range\n");
+				close(cd);
+				return -1;
+			}
+		}
+	}
+
+	/* Signal end of VMA list by shutting down write end */
+	shutdown(cd, SHUT_WR);
+
+	/* Receive the uffd via SCM_RIGHTS */
+	uffd = recv_fd(cd);
+	close(cd);
+
+	if (uffd < 0) {
+		err("setup_target_uffd: failed to receive uffd\n");
+		return -1;
+	}
+
+	log("setup_target_uffd: received uffd %d\n", uffd);
+	return uffd;
+}
+
+static struct lazy_pages_ctx lazy_ctx;
+
+static int cmd_restore_lazy(pid_t pid)
+{
+	int uffd;
+	char path[PATH_MAX];
+	int dump_fd;
+	int ret;
+
+	if (!parasite_status_ok()) {
+		return 1;
+	}
+
+	msg("setting up userfaultfd for lazy restore\n");
+
+	/* Set up userfaultfd in target process */
+	uffd = setup_target_uffd(pid, vmas, nr_vmas);
+	if (uffd < 0) {
+		err("lazy restore: uffd setup failed, falling back to eager restore\n");
+		return cmd_restore(pid);
+	}
+
+	/* Restore memory protections */
+	msg("mprotect on\n");
+	target_mprotect_on(pid);
+
+	/* Tell parasite to exit */
+	target_cmd_end(pid);
+
+	/* Open dump file for the lazy handler */
+	snprintf(path, sizeof(path), "%s/pages-%d.img", dump_dir, pid);
+	dump_fd = dump_open(path, O_RDONLY, 0);
+	if (dump_fd < 0) {
+		err("lazy restore: failed to open dump file %s: %m\n", path);
+		close(uffd);
+		return -1;
+	}
+
+	/* Build page index from dump file */
+	struct page_index *index = page_index_create();
+	if (!index) {
+		err("lazy restore: page_index_create failed\n");
+		close(uffd);
+		dump_close(dump_fd);
+		return -1;
+	}
+
+	ret = page_index_build(index, dump_fd, dump_read, compress != NULL);
+	if (ret < 0) {
+		err("lazy restore: page_index_build failed\n");
+		page_index_destroy(index);
+		close(uffd);
+		dump_close(dump_fd);
+		return -1;
+	}
+
+	msg("lazy restore: indexed %d regions, %lu total pages\n",
+	    index->nr_entries, index->total_pages);
+
+	/* Set up the lazy pages context */
+	memset(&lazy_ctx, 0, sizeof(lazy_ctx));
+	lazy_ctx.uffd = uffd;
+	lazy_ctx.dump_fd = dump_fd;
+	lazy_ctx.index = index;
+	lazy_ctx.target_pid = pid;
+	lazy_ctx.buf_size = MAX_VM_REGION_SIZE;
+	lazy_ctx.dump_read = dump_read;
+	lazy_ctx.dump_close = dump_close;
+
+	lazy_ctx.page_buf = malloc(MAX_VM_REGION_SIZE);
+	if (!lazy_ctx.page_buf) {
+		err("lazy restore: malloc page_buf failed\n");
+		page_index_destroy(index);
+		close(uffd);
+		dump_close(dump_fd);
+		return -1;
+	}
+
+	lazy_ctx.decomp_buf = malloc(MAX_VM_REGION_SIZE);
+	if (!lazy_ctx.decomp_buf) {
+		err("lazy restore: malloc decomp_buf failed\n");
+		free(lazy_ctx.page_buf);
+		page_index_destroy(index);
+		close(uffd);
+		dump_close(dump_fd);
+		return -1;
+	}
+
+	/* Start the lazy pages handler thread */
+	ret = lazy_pages_start(&lazy_ctx);
+	if (ret < 0) {
+		err("lazy restore: failed to start handler thread\n");
+		free(lazy_ctx.page_buf);
+		free(lazy_ctx.decomp_buf);
+		page_index_destroy(index);
+		close(uffd);
+		dump_close(dump_fd);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int read_cpu_regs(pid_t pid, struct registers *regs)
 {
 	struct iovec iov = {
@@ -2346,6 +2540,47 @@ static int execute_parasite_restore(pid_t pid)
 	int status;
 	int err;
 
+	if (lazy_pages) {
+		err = cmd_restore_lazy(pid);
+		if (err) {
+			err("cmd_restore_lazy() failed: %d\n", err);
+			return err;
+		}
+
+		/*
+		 * In lazy mode, cmd_restore_lazy() already called target_cmd_end()
+		 * to terminate the parasite. Wait for it.
+		 */
+		parasite_status_wait(&status);
+
+		if (WIFSIGNALED(status))
+			return 1;
+
+		assert(WIFEXITED(status) == 1);
+
+		/* munmap parasite_blob area */
+		ret = execute_blob(&ctx, munmap_blob, munmap_blob_size,
+				   (unsigned long)ctx.blob, sizeof(parasite_blob));
+		if (ret) {
+			err("munmap blob failed: %ld\n", ret);
+			return ret;
+		}
+
+		ret = signals_unblock(pid);
+		if (ret) {
+			err("signals_unblock() failed: %ld\n", ret);
+			return ret;
+		}
+
+		ctx_restore(pid);
+
+		/*
+		 * The lazy-pages handler thread is now running.
+		 * It will serve page faults as the process resumes.
+		 */
+		return 0;
+	}
+
 	err = cmd_restore(pid);
 	if (err) {
 		err("cmd_restore() failed: %d\n", err);
@@ -2595,6 +2830,13 @@ out:
 		kill(post_checkpoint_cmd.pid, SIGKILL);
 	}
 	unseize_target();
+
+	/* In lazy mode, wait for all pages to be served before worker exits */
+	if (lazy_pages && !ret && lazy_ctx.active) {
+		log("[%d] waiting for lazy-pages handler to complete...\n", getpid());
+		lazy_pages_wait(&lazy_ctx);
+	}
+
 	cleanup_pid(post_checkpoint_cmd.pid);
 
 	return ret;
@@ -3031,6 +3273,13 @@ out:
 	}
 
 	unseize_target();
+
+	/* In lazy mode, wait for all pages to be served before cleanup */
+	if (lazy_pages && !ret && lazy_ctx.active) {
+		msg("waiting for lazy-pages handler to complete...\n");
+		lazy_pages_wait(&lazy_ctx);
+	}
+
 	cleanup_pid(pid);
 
 	return ret;
@@ -3052,7 +3301,7 @@ static void print_version(void)
 static void usage(const char *name, int status)
 {
 	fprintf(status ? stderr : stdout,
-		"%s [-h] [-p PID] [-d DIR] [-S DIR] [-G gid] [-N] [-l PORT|PATH] [-g gid] [-n] [-m] [-f] [-z lz4|zstd] [-c] [-e] [-t] [-V]\n" \
+		"%s [-h] [-p PID] [-d DIR] [-S DIR] [-G gid] [-N] [-l PORT|PATH] [-g gid] [-n] [-m] [-f] [-z lz4|zstd] [-c] [-e] [-t] [-L] [-V]\n" \
 		"options:\n" \
 		"  -h --help		help\n" \
 		"  -p --pid		target process pid\n" \
@@ -3074,6 +3323,7 @@ static void usage(const char *name, int status)
 		"  -c --checksum		enable md5 checksum for memory dump\n" \
 		"  -e --encrypt		enable encryption of memory dump\n" \
 		"  -t --timeout		timeout in seconds for checkpoint/restore execution in service mode\n" \
+		"  -L --lazy-pages	use userfaultfd for lazy page restore (requires kernel >= 4.11)\n" \
 		"  -V --version		print version and exit\n",
 		name);
 
@@ -3118,6 +3368,7 @@ int main(int argc, char *argv[])
 		{ "checksum",			0,	NULL,	'c'},
 		{ "encrypt",			2,	NULL,	'e'},
 		{ "timeout",			1,	NULL,	't'},
+		{ "lazy-pages",			0,	NULL,	'L'},
 		{ "version",			0,	NULL,	'V'},
 		{ NULL,				0,	NULL,	0  }
 	};
@@ -3126,7 +3377,7 @@ int main(int argc, char *argv[])
 	parasite_socket_dir = NULL;
 	parasite_socket_use_netns = 0;
 
-	while ((opt = getopt_long(argc, argv, "hp:d:S:G:Nl:g:nmfzce::t:V", long_options, &option_index)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hp:d:S:G:Nl:g:nmfzce::t:LV", long_options, &option_index)) != -1) {
 		switch (opt) {
 			case 'h':
 				usage(argv[0], 0);
@@ -3188,6 +3439,9 @@ int main(int argc, char *argv[])
 				break;
 			case 't':
 				timeout = atoi(optarg);
+				break;
+			case 'L':
+				lazy_pages = 1;
 				break;
 			case 'V':
 				print_version();

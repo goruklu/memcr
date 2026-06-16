@@ -37,5 +37,8 @@ int sys_chmod(char* path, mode_t mode);
 int sys_chown(char* path, uid_t owner, gid_t group);
 int sys_getuid(void);
 int sys_open(char* path, mode_t mode);
+int sys_userfaultfd(int flags);
+int sys_ioctl(int fd, unsigned long cmd, unsigned long arg);
+int sys_sendmsg(int fd, struct msghdr *msg, int flags);
 
 #endif

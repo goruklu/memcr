@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <linux/fcntl.h> /* for O_RDONLY */
 #include <linux/fs.h> /* for SEEK_SET */
+#include <linux/userfaultfd.h>
 
 #include "memcr.h"
 #include "arch/syscall.h"
@@ -205,6 +206,85 @@ static int cmd_set_pages(const int cd)
 	return 0;
 }
 
+static int send_fd(int cd, int fd_to_send)
+{
+	struct msghdr msg;
+	struct iovec iov;
+	char buf[1] = {0};
+	char cmsg_buf[sizeof(struct cmsghdr) + sizeof(int)] __attribute__((aligned(sizeof(long))));
+	struct cmsghdr *cmsg;
+	int *fdptr;
+	int ret;
+
+	iov.iov_base = buf;
+	iov.iov_len = 1;
+
+	msg.msg_name = (void *)0;
+	msg.msg_namelen = 0;
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = cmsg_buf;
+	msg.msg_controllen = sizeof(cmsg_buf);
+	msg.msg_flags = 0;
+
+	cmsg = (struct cmsghdr *)cmsg_buf;
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = sizeof(cmsg_buf);
+
+	fdptr = (int *)((char *)cmsg + sizeof(struct cmsghdr));
+	*fdptr = fd_to_send;
+
+	ret = sys_sendmsg(cd, &msg, 0);
+	if (ret < 0)
+		die("sys_sendmsg() failed: ", ret);
+
+	return ret;
+}
+
+static int cmd_setup_uffd(const int cd)
+{
+	int ret;
+	int uffd;
+	struct uffdio_api api;
+	struct uffdio_register reg;
+	struct uffd_region_req req;
+
+	/* Create userfaultfd */
+	uffd = sys_userfaultfd(O_NONBLOCK | O_CLOEXEC);
+	if (uffd < 0)
+		die("sys_userfaultfd() failed: ", uffd);
+
+	/* Negotiate API */
+	api.api = UFFD_API;
+	api.features = 0;
+	api.ioctls = 0;
+	ret = sys_ioctl(uffd, UFFDIO_API, (unsigned long)&api);
+	if (ret < 0)
+		die("UFFDIO_API failed: ", ret);
+
+	/* Register each VMA range sent by the daemon */
+	while (1) {
+		ret = read(cd, &req, sizeof(req));
+		if (ret == 0)
+			break;
+
+		reg.range.start = req.addr;
+		reg.range.len = req.len;
+		reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+		ret = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long)&reg);
+		if (ret < 0)
+			die("UFFDIO_REGISTER failed: ", ret);
+	}
+
+	/* Send uffd back to daemon via SCM_RIGHTS */
+	send_fd(cd, uffd);
+
+	sys_close(uffd);
+
+	return 0;
+}
+
 static int cmd_end(const int cd)
 {
 	finish = 1;
@@ -228,6 +308,8 @@ static int handle_connection(const int cd)
 			return cmd_get_pages(cd);
 		case CMD_SET_PAGES:
 			return cmd_set_pages(cd);
+		case CMD_SETUP_UFFD:
+			return cmd_setup_uffd(cd);
 		case CMD_END:
 			return cmd_end(cd);
 		default:

@@ -133,3 +133,18 @@ size_t sys_lseek(int fd, size_t off, int whence)
 	return syscall3(__NR_lseek, fd, off, whence);
 }
 
+int sys_userfaultfd(int flags)
+{
+	return syscall1(__NR_userfaultfd, flags);
+}
+
+int sys_ioctl(int fd, unsigned long cmd, unsigned long arg)
+{
+	return syscall3(__NR_ioctl, fd, cmd, arg);
+}
+
+int sys_sendmsg(int fd, struct msghdr *msg, int flags)
+{
+	return syscall3(__NR_sendmsg, fd, (unsigned long)msg, flags);
+}
+
