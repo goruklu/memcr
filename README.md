@@ -54,7 +54,7 @@ memcr -p <target pid>
 ```
 For the list of available options, check memcr help:
 ```
-memcr [-h] [-p PID] [-d DIR] [-S DIR] [-G gid] [-N] [-l PORT|PATH] [-g gid] [-n] [-m] [-f] [-z lz4|zstd] [-c] [-e] [-t] [-V]
+memcr [-h] [-p PID] [-d DIR] [-S DIR] [-G gid] [-N] [-l PORT|PATH] [-g gid] [-n] [-m] [-f] [-z lz4|zstd] [-c] [-e] [-t] [-L] [-V]
 options:
   -h --help             help
   -p --pid              target process pid
@@ -76,6 +76,7 @@ options:
   -c --checksum         enable md5 checksum for memory dump
   -e --encrypt          enable encryption of memory dump
   -t --timeout          timeout in seconds for checkpoint/restore execution in service mode
+  -L --lazy-pages       use userfaultfd for lazy page restore (requires kernel >= 4.11)
   -V --version          print version and exit
 ```
 memcr also supports client / server scenario where memcr runs as a daemon and listens for commands from a client process. The main reason for supporting this is that memcr needs rather high privileges to hijack target process and it's a good idea to keep it separate from memcr-client that can run in a container with low privileges.
@@ -90,3 +91,29 @@ memcr-client -l 9000 -p 1234567 --checkpoint
 memcr-client -l 9000 -p 1234567 --restore
 ```
 Due to high priviledges of the memcr daemon it is recommended to run memcr daemon process as non-root user with elevated Linux capabilities and permissions, the details are described in: [doc/security_considerations.md](doc/security_considerations.md)
+
+#### lazy page restore
+
+By default, memcr restores all checkpointed pages back into the target process before resuming it. With `--lazy-pages` (`-L`), memcr uses Linux's `userfaultfd` mechanism to let the process resume immediately and serve pages on demand as they are accessed.
+
+This reduces the time the target process is frozen during restore -- only the checkpoint (download) phase blocks the process, while pages are uploaded lazily after the process resumes.
+
+How it works:
+1. During restore, a parasite running inside the target creates a `userfaultfd` and registers eligible VMAs (anonymous private mappings) for missing-page fault tracking
+2. The uffd file descriptor is sent to the memcr daemon via `SCM_RIGHTS`
+3. Stack and instruction pointer VMAs are excluded from uffd and restored eagerly (required for correct process resumption)
+4. The process resumes immediately
+5. A handler thread in the daemon polls the uffd for page faults, reads the corresponding page data from the dump file, and injects it via `UFFDIO_COPY`
+6. Idle time is used to prefetch remaining pages in the background
+
+Lazy-pages works with all dump configurations: plain, compressed (lz4/zstd), encrypted, and combined. Encrypted dumps are preloaded into memory at restore time since AES-CBC does not support random-access reads.
+
+Requirements: Linux kernel >= 4.11
+
+```
+memcr -p <pid> -n --lazy-pages
+memcr -p <pid> -n --lazy-pages --compress lz4
+sudo memcr -l 9000 --lazy-pages
+```
+
+For detailed design and implementation notes, see [doc/lazy-pages-design.md](doc/lazy-pages-design.md).
