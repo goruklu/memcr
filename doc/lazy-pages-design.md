@@ -58,12 +58,12 @@ memcr -l 9000 --lazy-pages
 |  +-------------------+    +--------------------------------+ |
 |  | setup_target_uffd |    |  lazy-pages handler thread     | |
 |  |                   |    |                                | |
-|  | - userfaultfd()   |    |  1. poll(uffd) for faults       | |
-|  | - UFFDIO_API      |    |  2. lookup page in index       | |
-|  | - send uffd to    |    |  3. read+decompress from dump  | |
+|  | - send VMA list   |    |  1. poll(uffd) for faults       | |
+|  |   to parasite     |    |  2. lookup page in index       | |
+|  | - recv uffd from  |    |  3. read+decompress from dump  | |
 |  |   parasite via    |    |     (or from preloaded memory) | |
-|  |   SCM_RIGHTS      |    |  4. UFFDIO_COPY into target    | |
-|  | - send VMA list   |    |  5. background prefetch        | |
+|  |   recvmsg         |    |  4. UFFDIO_COPY into target    | |
+|  |   (SCM_RIGHTS)    |    |  5. background prefetch        | |
 |  | - recv status     |    |  6. cleanup when done          | |
 |  +-------------------+    +--------------------------------+ |
 |           |                            ^                      |
@@ -81,16 +81,19 @@ memcr -l 9000 --lazy-pages
 |  | - start handler --+-----------------+                      |
 |  +-------------------+                                       |
 +--------------------------------------------------------------+
-         |                            |
+         ^                            |
          | UNIX socket (SCM_RIGHTS)   | userfaultfd
-         | to send uffd TO parasite   | UFFDIO_COPY
-         v                            v
+         | parasite sends uffd        | UFFDIO_COPY
+         | TO daemon                  |
+         |                            v
 +--------------------------------------------------------------+
 |                      Target Process                           |
 |                                                              |
 |  Parasite CMD_SETUP_UFFD:                                     |
-|  - recv uffd from daemon via recvmsg(SCM_RIGHTS)              |
+|  - userfaultfd() -> create uffd (bound to target's mm)        |
+|  - UFFDIO_API -> negotiate features                           |
 |  - UFFDIO_REGISTER for each VMA (must be in-process)          |
+|  - sendmsg(SCM_RIGHTS) -> send uffd to daemon                 |
 |  - send status byte back to daemon                            |
 |                                                              |
 |  +--------+ +--------+ +--------+ +--------+ +--------+     |
@@ -103,26 +106,6 @@ memcr -l 9000 --lazy-pages
 +--------------------------------------------------------------+
 ```
 
-### Privilege Split Design
-
-The userfaultfd creation is split between daemon and parasite for privilege
-reasons:
-
-- **`userfaultfd()` syscall** -- Called in the **daemon** (which runs as root).
-  This avoids `-EPERM` failures when the target process is unprivileged and
-  `vm.unprivileged_userfaultfd = 0` (the default since kernel 5.2).
-
-- **`UFFDIO_API` negotiation** -- Called in the **daemon** on the newly created
-  uffd. Can be done by any process holding the fd.
-
-- **`UFFDIO_REGISTER`** -- Called in the **parasite** (which runs in the
-  target's address space). This ioctl registers memory ranges for fault
-  tracking and must be called from the process whose mm owns the ranges.
-
-The uffd fd is transferred from daemon to parasite via `SCM_RIGHTS`
-(`sendmsg`/`recvmsg`). After registration, the daemon retains the uffd for
-fault handling; the parasite closes its copy.
-
 ### How It Differs from CRIU
 
 | Aspect | CRIU | memcr |
@@ -130,7 +113,7 @@ fault handling; the parasite closes its copy.
 | Process state | Fully recreated from scratch | Existing process, pages discarded via MADV_DONTNEED |
 | VMA creation | Restored by CRIU | Already exist (only page content is missing) |
 | Handler | Separate `criu lazy-pages` daemon process | Thread in the memcr daemon |
-| UFFD creation | During process restore | Daemon creates (privileged), parasite registers |
+| UFFD creation | During process restore | Parasite creates inside target, sends to daemon |
 | Page source | Local images, remote page-server, or network | Local dump file (with preload for encrypted) |
 | Stack handling | N/A (full restore) | Stack VMA excluded from uffd, eagerly restored |
 
@@ -147,40 +130,41 @@ CHECKPOINT (unchanged):
 
 RESTORE (with --lazy-pages):
   setup_target_uffd() [in daemon]:
-    1. userfaultfd(O_NONBLOCK | O_CLOEXEC) -> create uffd (privileged)
-    2. UFFDIO_API -> negotiate features
-    3. connect to parasite, send CMD_SETUP_UFFD
-    4. sendmsg(SCM_RIGHTS) -> send uffd fd to parasite
-    5. send VMA ranges (excluding stack/PC VMAs)
-    6. shutdown(SHUT_WR) -> signal end of VMA list
+    1. connect to parasite, send CMD_SETUP_UFFD
+    2. send VMA ranges (excluding stack/PC VMAs)
+    3. shutdown(SHUT_WR) -> signal end of VMA list
 
   parasite cmd_setup_uffd():
-    7. recvmsg(SCM_RIGHTS) -> receive uffd from daemon
-    8. For each VMA range received:
+    4. userfaultfd(O_NONBLOCK | O_CLOEXEC) -> create uffd (bound to target's mm)
+    5. UFFDIO_API -> negotiate features
+    6. For each VMA range received:
        UFFDIO_REGISTER -> MODE_MISSING
-    9. send status byte back (0 = success, 1 = failure)
-   10. close uffd copy (daemon retains its copy)
+    7. sendmsg(SCM_RIGHTS) -> send uffd fd to daemon
+    8. send status byte back (0 = success, 1 = failure)
+    9. close uffd copy (daemon retains the received copy)
 
   cmd_restore_lazy() [back in daemon]:
-   11. read status byte from parasite (verify registration success)
-   12. target_mprotect_on() -> restore original page protections
-   13. CMD_END -> parasite exits
+   10. switch socket to blocking mode
+   11. recvmsg(SCM_RIGHTS) -> receive uffd from parasite
+   12. read status byte from parasite (verify registration success)
+   13. target_mprotect_on() -> restore original page protections
+   14. CMD_END -> parasite exits
 
-   14. Build page_index from dump file:
+   15. Build page_index from dump file:
        - Non-encrypted: record file offsets for lseek+read later
        - Encrypted: read+decrypt+decompress all data into memory (preload)
-   15. Set up lazy_pages_ctx (buffers, function pointers)
+   16. Set up lazy_pages_ctx (buffers, function pointers)
 
   execute_parasite_restore():
-   16. parasite_status_wait() -> wait for parasite to exit
-   17. munmap parasite_blob area
-   18. Eagerly restore excluded VMA pages via /proc/pid/mem:
+   17. parasite_status_wait() -> wait for parasite to exit
+   18. munmap parasite_blob area
+   19. Eagerly restore excluded VMA pages via /proc/pid/mem:
        - Read page data from index (preloaded or from dump file)
        - pwrite() directly into target's address space
-   19. signals_unblock()
-   20. ctx_restore() -> restore original code and stack via ptrace
-   21. lazy_pages_start() -> spawn handler thread
-   22. unseize_target() -> PROCESS RESUMES IMMEDIATELY
+   20. signals_unblock()
+   21. ctx_restore() -> restore original code and stack via ptrace
+   22. lazy_pages_start() -> spawn handler thread
+   23. unseize_target() -> PROCESS RESUMES IMMEDIATELY
 
 LAZY-PAGES HANDLER THREAD (runs asynchronously):
   loop:
@@ -211,11 +195,13 @@ When userfaultfd is not available (kernel lacks `CONFIG_USERFAULTFD`, or the
 syscall returns `ENOSYS`/`EPERM`), the lazy restore path falls back to the
 standard eager restore automatically:
 
-1. `setup_target_uffd()` calls `userfaultfd()` in the daemon
-2. If it fails, returns -1 (no parasite interaction occurs)
-3. `cmd_restore_lazy()` detects the failure and calls `cmd_restore()` instead
-4. Returns a special code (`-2`) to `execute_parasite_restore()`
-5. `execute_parasite_restore()` recognizes the eager fallback code and returns
+1. The parasite attempts `userfaultfd()` inside the target process
+2. If it fails, the parasite returns -1 (no crash, no SIGILL)
+3. The parasite drains the VMA list (keeps protocol in sync) and stays alive
+   for the `CMD_SET_PAGES` eager restore fallback
+4. `cmd_restore_lazy()` detects the failure and calls `cmd_restore()` instead
+5. Returns a special code (`-2`) to `execute_parasite_restore()`
+6. `execute_parasite_restore()` recognizes the eager fallback code and returns
    immediately, skipping the lazy-pages post-processing path (parasite wait,
    munmap, `/proc/pid/mem` eager stack restore, handler thread start)
 
@@ -251,9 +237,9 @@ These excluded VMAs are instead restored eagerly via `/proc/<pid>/mem` using
 ### Socket Blocking for SCM_RIGHTS
 
 The parasite socket is created with `SOCK_NONBLOCK` for the normal command
-protocol. When transferring the uffd via `sendmsg(SCM_RIGHTS)` and waiting
-for the parasite's status response, the daemon switches the socket to blocking
-mode (`fcntl(F_SETFL, ~O_NONBLOCK)`).
+protocol. When receiving the uffd from the parasite via `recvmsg(SCM_RIGHTS)`
+and reading the parasite's status response, the daemon switches the socket to
+blocking mode (`fcntl(F_SETFL, ~O_NONBLOCK)`).
 
 ### Handler Thread Lifecycle
 
@@ -310,11 +296,11 @@ This uses more memory (~working set size) but is necessary for correctness.
 
 | File | Action | Purpose |
 |------|--------|---------|
-| `memcr.c` | Modified | CLI option, lazy restore flow, uffd creation (privileged), `send_fd()`, eager stack restore, fallback handling |
+| `memcr.c` | Modified | CLI option, lazy restore flow, `recv_fd()`, eager stack restore, fallback handling |
 | `memcr.h` | Modified | `CMD_SETUP_UFFD` enum, `struct uffd_region_req` |
-| `parasite.c` | Modified | `cmd_setup_uffd()` receives uffd + does UFFDIO_REGISTER, `recv_fd()` helper |
-| `arch/syscall.h` | Modified | Declare `sys_userfaultfd`, `sys_ioctl`, `sys_sendmsg`, `sys_recvmsg` |
-| `arch/syscall.c` | Modified | Implement syscall wrappers including `sys_recvmsg` |
+| `parasite.c` | Modified | `cmd_setup_uffd()` creates uffd + does UFFDIO_API + UFFDIO_REGISTER, `send_fd()` helper |
+| `arch/syscall.h` | Modified | Declare `sys_userfaultfd`, `sys_ioctl`, `sys_sendmsg` |
+| `arch/syscall.c` | Modified | Implement syscall wrappers including `sys_sendmsg` |
 | `lazy-pages.c` | **New** | Handler thread, fault resolution, prefetch, `lazy_pages_serve_page()` |
 | `lazy-pages.h` | **New** | `struct lazy_pages_ctx`, public API |
 | `page-index.c` | **New** | Index build (plain/compressed/encrypted), binary search lookup |
@@ -387,9 +373,10 @@ show much better wall time.
   data into memory (~working set size of additional RAM).
 - **No remote pages:** All pages served from local dump file only.
 - **Single target:** One target process per lazy-pages handler instance.
-- **Privileges:** The memcr daemon must run as root (or with `CAP_SYS_PTRACE`)
-  to create the userfaultfd. The target process does not need any special
-  privileges.
+- **Privileges:** The target process (and therefore the parasite) must be able
+  to call `userfaultfd()`. This requires either `vm.unprivileged_userfaultfd=1`
+  (sysctl) or the target having `CAP_SYS_PTRACE`. If neither is satisfied,
+  `userfaultfd()` returns `-EPERM` and memcr falls back to eager restore.
 - **Stack VMA:** Always eagerly restored (not lazy). This is typically small
   (8-132 KB) and required for correct process resumption.
 
