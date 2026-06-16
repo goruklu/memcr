@@ -59,4 +59,11 @@ void lazy_pages_wait(struct lazy_pages_ctx *ctx);
  */
 void lazy_pages_stop(struct lazy_pages_ctx *ctx);
 
+/*
+ * Eagerly serve a single page fault at the given address.
+ * Used to inject critical pages (PC/SP) before ctx_restore.
+ * Returns 0 on success, -1 on error (e.g., address not in index).
+ */
+int lazy_pages_serve_page(struct lazy_pages_ctx *ctx, unsigned long addr);
+
 #endif /* __LAZY_PAGES_H__ */

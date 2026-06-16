@@ -2040,6 +2040,8 @@ static int setup_target_uffd(pid_t pid, struct vm_area *target_vmas, int target_
 	int uffd;
 	int ret;
 	int i;
+	unsigned long pc_page = (unsigned long)ctx.pc & ~((unsigned long)page_size - 1);
+	unsigned long sp_page = (unsigned long)ctx.sp & ~((unsigned long)page_size - 1);
 
 	cd = parasite_connect(pid);
 	if (cd < 0)
@@ -2057,6 +2059,25 @@ static int setup_target_uffd(pid_t pid, struct vm_area *target_vmas, int target_
 		if (target_vmas[i].flags == FLAG_ANON ||
 		    target_vmas[i].flags == FLAG_STACK ||
 		    target_vmas[i].flags == FLAG_HEAP) {
+			/*
+			 * Skip VMAs containing the original PC or SP.
+			 * These pages need to remain accessible for ptrace
+			 * POKEDATA during ctx_restore() before the process
+			 * resumes.
+			 */
+			if (pc_page >= target_vmas[i].start &&
+			    pc_page < target_vmas[i].end) {
+				log("setup_target_uffd: skipping VMA %lx-%lx (contains PC)\n",
+				    target_vmas[i].start, target_vmas[i].end);
+				continue;
+			}
+			if (sp_page >= target_vmas[i].start &&
+			    sp_page < target_vmas[i].end) {
+				log("setup_target_uffd: skipping VMA %lx-%lx (contains SP)\n",
+				    target_vmas[i].start, target_vmas[i].end);
+				continue;
+			}
+
 			struct uffd_region_req req = {
 				.addr = target_vmas[i].start,
 				.len = target_vmas[i].end - target_vmas[i].start,
@@ -2072,6 +2093,18 @@ static int setup_target_uffd(pid_t pid, struct vm_area *target_vmas, int target_
 
 	/* Signal end of VMA list by shutting down write end */
 	shutdown(cd, SHUT_WR);
+
+	/*
+	 * Switch socket to blocking mode for recvmsg.
+	 * parasite_connect() creates the socket with SOCK_NONBLOCK,
+	 * but we need to block here waiting for the parasite to
+	 * send the uffd back via SCM_RIGHTS.
+	 */
+	{
+		int flags = fcntl(cd, F_GETFL, 0);
+		if (flags >= 0)
+			fcntl(cd, F_SETFL, flags & ~O_NONBLOCK);
+	}
 
 	/* Receive the uffd via SCM_RIGHTS */
 	uffd = recv_fd(cd);
@@ -2174,17 +2207,11 @@ static int cmd_restore_lazy(pid_t pid)
 		return -1;
 	}
 
-	/* Start the lazy pages handler thread */
-	ret = lazy_pages_start(&lazy_ctx);
-	if (ret < 0) {
-		err("lazy restore: failed to start handler thread\n");
-		free(lazy_ctx.page_buf);
-		free(lazy_ctx.decomp_buf);
-		page_index_destroy(index);
-		close(uffd);
-		dump_close(dump_fd);
-		return -1;
-	}
+	/*
+	 * Don't start the handler thread yet - it will be started
+	 * after ctx_restore in execute_parasite_restore_lazy.
+	 * We need to eagerly serve PC/SP pages first without races.
+	 */
 
 	return 0;
 }
@@ -2566,6 +2593,70 @@ static int execute_parasite_restore(pid_t pid)
 			return ret;
 		}
 
+		/*
+		 * Eagerly restore pages in VMAs that were excluded from uffd
+		 * (stack/PC VMAs). These pages were MADV_DONTNEED'd during
+		 * checkpoint but not registered with userfaultfd, so they
+		 * must be restored eagerly via /proc/pid/mem.
+		 */
+		{
+			char mem_path[PATH_MAX];
+			int mem_fd;
+			unsigned long pc_page = (unsigned long)ctx.pc & ~((unsigned long)page_size - 1);
+			unsigned long sp_page = (unsigned long)ctx.sp & ~((unsigned long)page_size - 1);
+			int j;
+
+			snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+			mem_fd = open(mem_path, O_WRONLY);
+			if (mem_fd >= 0) {
+				char *buf = lazy_ctx.page_buf;
+
+				/*
+				 * Find all page index entries that fall within
+				 * excluded VMAs and restore them eagerly.
+				 */
+				for (j = 0; j < lazy_ctx.index->nr_entries; j++) {
+					struct page_index_entry *entry = &lazy_ctx.index->entries[j];
+					unsigned long entry_start = entry->addr;
+					int in_excluded_vma = 0;
+					int k;
+
+					if (entry->served)
+						continue;
+
+					/* Check if this entry is in an excluded VMA */
+					for (k = 0; k < nr_vmas; k++) {
+						if (vmas[k].flags != FLAG_ANON &&
+						    vmas[k].flags != FLAG_STACK &&
+						    vmas[k].flags != FLAG_HEAP)
+							continue;
+
+						if (entry_start >= vmas[k].start &&
+						    entry_start < vmas[k].end) {
+							/* Is this VMA excluded? */
+							if ((pc_page >= vmas[k].start && pc_page < vmas[k].end) ||
+							    (sp_page >= vmas[k].start && sp_page < vmas[k].end)) {
+								in_excluded_vma = 1;
+							}
+							break;
+						}
+					}
+
+					if (in_excluded_vma) {
+						lseek(lazy_ctx.dump_fd, entry->file_offset, SEEK_SET);
+						if (compress_read(buf, entry->len, lazy_ctx.dump_read, lazy_ctx.dump_fd) > 0) {
+							pwrite(mem_fd, buf, entry->len, entry->addr);
+						}
+						page_index_mark_served(lazy_ctx.index, entry);
+					}
+				}
+
+				close(mem_fd);
+			} else {
+				err("lazy restore: failed to open %s: %m\n", mem_path);
+			}
+		}
+
 		ret = signals_unblock(pid);
 		if (ret) {
 			err("signals_unblock() failed: %ld\n", ret);
@@ -2573,6 +2664,13 @@ static int execute_parasite_restore(pid_t pid)
 		}
 
 		ctx_restore(pid);
+
+		/* Now start the lazy-pages handler thread */
+		ret = lazy_pages_start(&lazy_ctx);
+		if (ret) {
+			err("lazy restore: failed to start handler thread\n");
+			return ret;
+		}
 
 		/*
 		 * The lazy-pages handler thread is now running.

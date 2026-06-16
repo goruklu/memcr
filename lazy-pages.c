@@ -391,3 +391,8 @@ void lazy_pages_stop(struct lazy_pages_ctx *ctx)
 		ctx->dump_fd = -1;
 	}
 }
+
+int lazy_pages_serve_page(struct lazy_pages_ctx *ctx, unsigned long addr)
+{
+	return handle_page_fault(ctx, addr);
+}
