@@ -3197,6 +3197,14 @@ out:
 	}
 	unseize_target();
 
+	/*
+	 * Send the restore response BEFORE waiting for lazy pages.
+	 * The target process is already running at this point -- from
+	 * the client's perspective, the restore is complete. The lazy
+	 * handler will continue serving pages in the background.
+	 */
+	ret |= send_response_to_service(rd, ret);
+
 	/* In lazy mode, wait for all pages to be served before worker exits */
 	if (lazy_pages && !ret && lazy_ctx.active) {
 		log("[%d] waiting for lazy-pages handler to complete...\n", getpid());
@@ -3248,7 +3256,6 @@ static int application_worker(pid_t pid, int checkpoint_resp_socket)
 	}
 
 	ret = restore_worker(rd);
-	ret |= send_response_to_service(rd, ret);
 
 	close(rsd);
 	close(rd);
