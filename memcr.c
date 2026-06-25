@@ -3197,12 +3197,6 @@ out:
 	}
 	unseize_target();
 
-	/*
-	 * Send the restore response BEFORE waiting for lazy pages.
-	 * The target process is already running at this point -- from
-	 * the client's perspective, the restore is complete. The lazy
-	 * handler will continue serving pages in the background.
-	 */
 	ret |= send_response_to_service(rd, ret);
 
 	/* In lazy mode, wait for all pages to be served before worker exits */
@@ -3340,13 +3334,15 @@ static void restore_procedure_service(int cd, struct service_command svc_cmd, in
 		ret = -1;
 	}
 
-	if (timeout) {
+	if (timeout && !lazy_pages) {
 		msg("Service waiting for worker to restore with timeout %d[s]...\n", timeout);
 		struct timeval rcv_timeout = { .tv_sec = timeout, .tv_usec = 0 };
 		ret = setsockopt(rd, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
 		if (ret < 0)
 			err("Error setting socket timeout: %m, waiting forever!\n");
-	} else
+	} else if (lazy_pages)
+		msg("Service waiting for worker to restore (lazy-pages, no timeout)...\n");
+	else
 		msg("Service waiting for worker to restore... \n");
 
 	ret = _read(rd, &svc_resp, sizeof(struct service_response));   // read response from service
