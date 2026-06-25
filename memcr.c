@@ -2652,70 +2652,76 @@ static int execute_parasite_restore(pid_t pid)
 		 * Eagerly restore pages in VMAs that were excluded from uffd
 		 * (stack/PC VMAs). These pages were MADV_DONTNEED'd during
 		 * checkpoint but not registered with userfaultfd, so they
-		 * must be restored eagerly via /proc/pid/mem.
+		 * must be restored before ctx_restore().
+		 *
+		 * Try /proc/pid/mem first (fast), fall back to ptrace
+		 * POKEDATA if /proc/pid/mem is not accessible (e.g. target
+		 * in a different pid/user namespace).
 		 */
 		{
 			char mem_path[PATH_MAX];
-			int mem_fd;
+			int mem_fd = -1;
 			unsigned long pc_page = (unsigned long)ctx.pc & ~((unsigned long)page_size - 1);
 			unsigned long sp_page = (unsigned long)ctx.sp & ~((unsigned long)page_size - 1);
 			int j;
+			char *buf = lazy_ctx.page_buf;
 
 			snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
 			mem_fd = open(mem_path, O_WRONLY);
-			if (mem_fd >= 0) {
-				char *buf = lazy_ctx.page_buf;
+			if (mem_fd < 0)
+				log("lazy restore: /proc/pid/mem not available, using ptrace for stack restore\n");
 
-				/*
-				 * Find all page index entries that fall within
-				 * excluded VMAs and restore them eagerly.
-				 */
-				for (j = 0; j < lazy_ctx.index->nr_entries; j++) {
-					struct page_index_entry *entry = &lazy_ctx.index->entries[j];
-					unsigned long entry_start = entry->addr;
-					int in_excluded_vma = 0;
-					int k;
+			for (j = 0; j < lazy_ctx.index->nr_entries; j++) {
+				struct page_index_entry *entry = &lazy_ctx.index->entries[j];
+				unsigned long entry_start = entry->addr;
+				int in_excluded_vma = 0;
+				int k;
 
-					if (entry->served)
+				if (entry->served)
+					continue;
+
+				/* Check if this entry is in an excluded VMA */
+				for (k = 0; k < nr_vmas; k++) {
+					if (vmas[k].flags != FLAG_ANON &&
+					    vmas[k].flags != FLAG_STACK &&
+					    vmas[k].flags != FLAG_HEAP)
 						continue;
 
-					/* Check if this entry is in an excluded VMA */
-					for (k = 0; k < nr_vmas; k++) {
-						if (vmas[k].flags != FLAG_ANON &&
-						    vmas[k].flags != FLAG_STACK &&
-						    vmas[k].flags != FLAG_HEAP)
-							continue;
-
-						if (entry_start >= vmas[k].start &&
-						    entry_start < vmas[k].end) {
-							/* Is this VMA excluded? */
-							if ((pc_page >= vmas[k].start && pc_page < vmas[k].end) ||
-							    (sp_page >= vmas[k].start && sp_page < vmas[k].end)) {
-								in_excluded_vma = 1;
-							}
-							break;
+					if (entry_start >= vmas[k].start &&
+					    entry_start < vmas[k].end) {
+						if ((pc_page >= vmas[k].start && pc_page < vmas[k].end) ||
+						    (sp_page >= vmas[k].start && sp_page < vmas[k].end)) {
+							in_excluded_vma = 1;
 						}
-					}
-
-					if (in_excluded_vma) {
-						if (entry->data) {
-							/* Preloaded (encrypted): data is in memory */
-							pwrite(mem_fd, entry->data, entry->len, entry->addr);
-						} else {
-							/* Non-encrypted: seek and read from file */
-							lseek(lazy_ctx.dump_fd, entry->file_offset, SEEK_SET);
-							if (compress_read(buf, entry->len, lazy_ctx.dump_read, lazy_ctx.dump_fd) > 0) {
-								pwrite(mem_fd, buf, entry->len, entry->addr);
-							}
-						}
-						page_index_mark_served(lazy_ctx.index, entry);
+						break;
 					}
 				}
 
-				close(mem_fd);
-			} else {
-				err("lazy restore: failed to open %s: %m\n", mem_path);
+				if (in_excluded_vma) {
+					char *src;
+
+					if (entry->data) {
+						src = entry->data;
+					} else {
+						lseek(lazy_ctx.dump_fd, entry->file_offset, SEEK_SET);
+						if (compress_read(buf, entry->len, lazy_ctx.dump_read, lazy_ctx.dump_fd) <= 0)
+							continue;
+						src = buf;
+					}
+
+					if (mem_fd >= 0) {
+						pwrite(mem_fd, src, entry->len, entry->addr);
+					} else {
+						/* Fallback: use ptrace POKEDATA */
+						poke(pid, (unsigned long *)entry->addr,
+						     (unsigned long *)src, entry->len);
+					}
+					page_index_mark_served(lazy_ctx.index, entry);
+				}
 			}
+
+			if (mem_fd >= 0)
+				close(mem_fd);
 		}
 
 		ret = signals_unblock(pid);
