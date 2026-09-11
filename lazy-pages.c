@@ -65,7 +65,7 @@ static int read_region_data(struct lazy_pages_ctx *ctx, struct page_index_entry 
 	}
 
 	/* Non-encrypted: seek and decompress from file */
-	if (lseek(ctx->dump_fd, entry->file_offset, SEEK_SET) < 0) {
+	if (ctx->dump_seek(ctx->dump_fd, entry->file_offset) < 0) {
 		err("lazy-pages: lseek to offset %ld failed: %m\n",
 		    (long)entry->file_offset);
 		return -1;

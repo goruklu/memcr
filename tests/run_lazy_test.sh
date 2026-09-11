@@ -217,6 +217,9 @@ if [ -n "$LIBENC" ]; then
 
 	do_lazy_test "env LD_PRELOAD=$LIBENC" "--rss-file --encrypt aes-256-cbc" "test-malloc" \
 		"lazy restore: with AES-256-CBC encryption" || true
+
+	do_lazy_test "env LD_PRELOAD=$LIBENC" "--rss-file --encrypt aes-256-gcm" "test-malloc" \
+		"lazy restore: with AES-256-GCM encryption" || true
 else
 	echo "${YELLOW}[skip] libencrypt.so not found, skipping encryption tests${NOFMT}"
 	TEST_SKIP=$((TEST_SKIP + 2))
@@ -231,6 +234,9 @@ if ! $DO$MEMCR -p 1 -n --compress lz4 2>&1 | grep -q "not available"; then
 	if [ -n "$LIBENC" ]; then
 		do_lazy_test "env LD_PRELOAD=$LIBENC" "--rss-file --compress lz4 --encrypt" "test-malloc" \
 			"lazy restore: LZ4 + encryption" || true
+
+		do_lazy_test "env LD_PRELOAD=$LIBENC" "--rss-file --compress lz4 --encrypt aes-256-gcm" "test-malloc" \
+			"lazy restore: LZ4 + AES-256-GCM encryption" || true
 	fi
 fi
 

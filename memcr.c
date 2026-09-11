@@ -257,6 +257,10 @@ int __attribute__((weak)) lib__read(int fd, void *buf, size_t count);
 int __attribute__((weak)) lib__write(int fd, const void *buf, size_t count);
 int __attribute__((weak)) lib__init(int enable, const char *arg);
 int __attribute__((weak)) lib__fini(void);
+int __attribute__((weak)) lib__random_access(void);
+off_t __attribute__((weak)) lib__tell(int fd);
+int __attribute__((weak)) lib__seek(int fd, off_t offset);
+int __attribute__((weak)) lib__skip(int fd);
 
 #define CHECKPOINTED_PIDS_LIMIT 48
 #define PID_INVALID		0
@@ -893,6 +897,20 @@ static int dump_write(int fd, const void *buf, size_t count)
 		ret = _write(fd, buf, count);
 
 	return ret;
+}
+
+static off_t dump_tell(int fd)
+{
+	if (lib__tell)
+		return lib__tell(fd);
+	return lseek(fd, 0, SEEK_CUR);
+}
+
+static int dump_seek(int fd, off_t offset)
+{
+	if (lib__seek)
+		return lib__seek(fd, offset);
+	return lseek(fd, offset, SEEK_SET) == offset ? 0 : -1;
 }
 
 static void clear_checkpoint_options(struct service_options *options)
@@ -2228,7 +2246,8 @@ static int cmd_restore_lazy(pid_t pid)
 	}
 
 	ret = page_index_build(index, dump_fd, dump_read, compress != NULL,
-			       lib__read != NULL, compress_read);
+			       lib__read != NULL, compress_read, dump_tell,
+			       lib__random_access && lib__random_access() ? lib__skip : NULL);
 	if (ret < 0) {
 		err("lazy restore: page_index_build failed\n");
 		page_index_destroy(index);
@@ -2285,6 +2304,7 @@ static int cmd_restore_lazy(pid_t pid)
 	lazy_ctx.buf_size = MAX_VM_REGION_SIZE;
 	lazy_ctx.dump_read = dump_read;
 	lazy_ctx.dump_close = dump_close;
+	lazy_ctx.dump_seek = dump_seek;
 	strncpy(lazy_ctx.dump_path, path, sizeof(lazy_ctx.dump_path) - 1);
 
 	lazy_ctx.page_buf = malloc(MAX_VM_REGION_SIZE);
@@ -2784,6 +2804,7 @@ static int execute_parasite_restore(pid_t pid)
 			char mem_path[PATH_MAX];
 			int mem_fd = -1;
 			int local_dump_fd = -1;
+			int eager_restore_failed = 0;
 			int j;
 			char *buf = malloc(MAX_VM_REGION_SIZE);
 
@@ -2820,19 +2841,28 @@ static int execute_parasite_restore(pid_t pid)
 							}
 						}
 
-						lseek(local_dump_fd, entry->file_offset, SEEK_SET);
-						if (compress_read(buf, entry->len, lazy_ctx.dump_read, local_dump_fd) <= 0)
+						if (dump_seek(local_dump_fd, entry->file_offset) < 0 ||
+						    compress_read(buf, entry->len, lazy_ctx.dump_read,
+								  local_dump_fd) <= 0)
 							continue;
 						src = buf;
 					}
 
 					if (mem_fd >= 0) {
-						pwrite(mem_fd, src, entry->len, entry->addr);
+						if (pwrite(mem_fd, src, entry->len, entry->addr) !=
+						    (ssize_t)entry->len) {
+							err("lazy restore: failed to write excluded region "
+							    "%lx: %m\n", entry->addr);
+							eager_restore_failed = 1;
+						}
 					} else {
 						/* Fallback: use ptrace POKEDATA */
-						poke(pid, (unsigned long *)entry->addr,
-						     (unsigned long *)src, entry->len);
+						if (poke(pid, (unsigned long *)entry->addr,
+							 (unsigned long *)src, entry->len))
+							eager_restore_failed = 1;
 					}
+					if (eager_restore_failed)
+						break;
 					page_index_mark_served(lazy_ctx.index, entry);
 				}
 			}
@@ -2846,6 +2876,10 @@ static int execute_parasite_restore(pid_t pid)
 					close(local_dump_fd);
 			}
 			free(buf);
+			if (eager_restore_failed) {
+				err("lazy restore: excluded VMA restore failed\n");
+				return -1;
+			}
 		}
 
 		msg("eager stack restore done\n");

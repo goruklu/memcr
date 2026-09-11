@@ -50,6 +50,7 @@ struct lazy_pages_ctx {
 	/* Dump file I/O functions (support encryption layer) */
 	int (*dump_read)(int fd, void *buf, size_t count);
 	int (*dump_close)(int fd);
+	int (*dump_seek)(int fd, off_t offset);
 };
 
 /*

@@ -97,6 +97,7 @@ int page_index_add(struct page_index *idx, unsigned long addr, unsigned long len
 	entry->on_disk_len = on_disk_len;
 	entry->data = NULL;
 	entry->served = 0;
+	entry->excluded = 0;
 
 	idx->nr_entries++;
 	idx->total_pages += len / PAGE_SIZE;
@@ -140,7 +141,8 @@ int page_index_build(struct page_index *idx, int dump_fd,
 		     int compressed, int encrypted,
 		     int (*decompress_fn)(char *dst, const size_t len,
 					  int (*xread)(int fd, void *buf, size_t count),
-					  int fd))
+					  int fd),
+		     off_t (*tell_fn)(int fd), int (*skip_fn)(int fd))
 {
 	struct vm_region vmr;
 	off_t data_offset;
@@ -163,7 +165,7 @@ int page_index_build(struct page_index *idx, int dump_fd,
 			return -1;
 		}
 
-		if (encrypted) {
+		if (encrypted && !skip_fn) {
 			/*
 			 * Encrypted mode: read and decompress data now,
 			 * store it in memory for later use.
@@ -191,7 +193,7 @@ int page_index_build(struct page_index *idx, int dump_fd,
 			idx->entries[idx->nr_entries - 1].data = page_data;
 		} else {
 			/* Non-encrypted: record file offset, skip data */
-			data_offset = lseek(dump_fd, 0, SEEK_CUR);
+			data_offset = tell_fn ? tell_fn(dump_fd) : lseek(dump_fd, 0, SEEK_CUR);
 			if (data_offset < 0) {
 				err("page_index_build: lseek for data offset failed\n");
 				return -1;
@@ -207,13 +209,15 @@ int page_index_build(struct page_index *idx, int dump_fd,
 				on_disk_len = sizeof(comp_len) + comp_len;
 
 				/* Skip past compressed data */
-				if (lseek(dump_fd, comp_len, SEEK_CUR) < 0) {
+				if (skip_fn ? skip_fn(dump_fd) :
+				    lseek(dump_fd, comp_len, SEEK_CUR) < 0) {
 					err("page_index_build: lseek past compressed data failed\n");
 					return -1;
 				}
 			} else {
 				on_disk_len = vmr.len;
-				if (lseek(dump_fd, vmr.len, SEEK_CUR) < 0) {
+				if (skip_fn ? skip_fn(dump_fd) :
+				    lseek(dump_fd, vmr.len, SEEK_CUR) < 0) {
 					err("page_index_build: lseek past raw data failed\n");
 					return -1;
 				}
@@ -227,7 +231,7 @@ int page_index_build(struct page_index *idx, int dump_fd,
 		}
 	}
 
-	if (encrypted)
+	if (encrypted && !skip_fn)
 		idx->preloaded = 1;
 
 	/* Sort entries by address for binary search */

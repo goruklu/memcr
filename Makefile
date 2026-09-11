@@ -195,7 +195,7 @@ $(B)/memcr-client: $(B)/memcr-client.o $(B)/libmemcrclient.a
 
 
 $(B)/libencrypt.so: libencrypt.c
-	$(CC) $(CFLAGS) -fPIC -shared -Wl,-soname,$(@F) $^ -lcrypto -o $@
+	$(CC) $(MCFLAGS) -fPIC -shared -Wl,-soname,$(@F) $^ -lcrypto -o $@
 	@stat -c "-> %n: %s bytes <-" $@
 	@size $@
 
