@@ -1920,7 +1920,6 @@ static int target_cmd_end(int pid)
 	return ret;
 }
 
-#if LOG_LEVEL >= 2
 static long diff_ms(struct timespec *ts)
 {
 	struct timespec tsn;
@@ -1929,7 +1928,6 @@ static long diff_ms(struct timespec *ts)
 
 	return (tsn.tv_sec*1000 + tsn.tv_nsec/1000000) - (ts->tv_sec*1000 + ts->tv_nsec/1000000);
 }
-#endif
 
 static int cmd_checkpoint(pid_t pid)
 {
@@ -3323,7 +3321,9 @@ out:
 static int restore_worker(int rd)
 {
 	int ret;
+	int lazy_handler_active;
 	struct service_command post_checkpoint_cmd;
+	struct timespec restore_start;
 
 	ret = read_command(rd, &post_checkpoint_cmd);
 
@@ -3333,6 +3333,7 @@ static int restore_worker(int rd)
 	}
 
 	log("[%d] Worker received RESTORE command for %d.\n", getpid(), post_checkpoint_cmd.pid);
+	clock_gettime(CLOCK_MONOTONIC, &restore_start);
 
 	signal(SIGCHLD, SIG_DFL);
 	ret = execute_parasite_restore(post_checkpoint_cmd.pid);
@@ -3342,7 +3343,11 @@ out:
 		err("[%d] %s() Restore failed! Killing the target PID %d...\n", getpid(), __func__, post_checkpoint_cmd.pid);
 		kill(post_checkpoint_cmd.pid, SIGKILL);
 	}
+	lazy_handler_active = lazy_pages && !ret && lazy_ctx.active;
 	unseize_target();
+	msg("restore: pid %d resumed after %ld ms (%s)\n",
+	    post_checkpoint_cmd.pid, diff_ms(&restore_start),
+	    lazy_handler_active ? "lazy-pages" : "eager");
 
 	ret |= send_response_to_service(rd, ret);
 
@@ -3350,6 +3355,8 @@ out:
 	if (lazy_pages && !ret && lazy_ctx.active) {
 		log("[%d] waiting for lazy-pages handler to complete...\n", getpid());
 		lazy_pages_wait(&lazy_ctx);
+		msg("restore: pid %d all indexed pages served after %ld ms\n",
+		    post_checkpoint_cmd.pid, diff_ms(&restore_start));
 	}
 
 	cleanup_pid(post_checkpoint_cmd.pid, dfl_dump_dir);
