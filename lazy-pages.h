@@ -35,6 +35,17 @@ struct lazy_pages_ctx {
 	size_t buf_size;		/* size of page_buf / decomp_buf */
 	pthread_t thread;		/* handler thread id */
 	int active;			/* 1 if handler is running */
+	unsigned long zero_fallback_count; /* number of faults with no index
+					     * entry, served via UFFDIO_ZEROPAGE.
+					     * Rate-limited logging uses this to
+					     * avoid flooding the log with one
+					     * line per fault (can easily be
+					     * thousands for a large app). */
+	char dump_path[4096];		/* path to dump file, so callers other
+					 * than the handler thread (e.g. eager
+					 * stack restore in the main thread)
+					 * can open their own independent fd
+					 * instead of racing on dump_fd */
 
 	/* Dump file I/O functions (support encryption layer) */
 	int (*dump_read)(int fd, void *buf, size_t count);

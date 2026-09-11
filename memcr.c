@@ -213,6 +213,21 @@ static struct target_context ctx;
 
 static sig_atomic_t interrupted;
 
+/*
+ * Side channel for when the generic SIGCHLD reaper (sigchld_handler_service/
+ * sigchld_handler_worker) races with the dedicated parasite_watch_thread's
+ * targeted wait4(parasite_pid, ...). Since ptrace tracees are reapable by
+ * any thread in the tracer process regardless of true parent/child
+ * relationship, a wildcard waitpid(-1, ...) in the generic reaper can steal
+ * the parasite's exit status before the dedicated watcher's wait4() gets to
+ * it, causing the watcher to see ECHILD and silently give up without ever
+ * signaling parasite_status_signal(). These globals let the (async-signal-
+ * safe) generic reaper stash the status so the watcher thread can pick it
+ * up instead of hanging forever.
+ */
+static volatile sig_atomic_t parasite_reaped_by_sigchld;
+static volatile int parasite_reaped_status;
+
 static struct {
 	pthread_t thread_id;
 	pthread_mutex_t lock;
@@ -2227,6 +2242,42 @@ static int cmd_restore_lazy(pid_t pid)
 	msg("lazy restore: indexed %d regions, %lu total pages\n",
 	    index->nr_entries, index->total_pages);
 
+	/*
+	 * Mark index entries that fall within excluded VMAs (containing
+	 * PC or SP -- see setup_target_uffd()). These addresses were
+	 * never registered with the uffd, so the lazy handler's
+	 * background prefetch must never attempt UFFDIO_COPY on them
+	 * (it would fail, and previously the code marked them "served"
+	 * anyway, permanently preventing the eager-restore path below
+	 * from ever properly restoring them via ptrace/proc-mem). They
+	 * are restored eagerly in execute_parasite_restore() instead.
+	 */
+	{
+		unsigned long pc_page = (unsigned long)ctx.pc & ~((unsigned long)page_size - 1);
+		unsigned long sp_page = (unsigned long)ctx.sp & ~((unsigned long)page_size - 1);
+		int j, k;
+
+		for (j = 0; j < index->nr_entries; j++) {
+			struct page_index_entry *entry = &index->entries[j];
+
+			for (k = 0; k < nr_vmas; k++) {
+				if (vmas[k].flags != FLAG_ANON &&
+				    vmas[k].flags != FLAG_STACK &&
+				    vmas[k].flags != FLAG_HEAP)
+					continue;
+
+				if (entry->addr >= vmas[k].start &&
+				    entry->addr < vmas[k].end) {
+					if ((pc_page >= vmas[k].start && pc_page < vmas[k].end) ||
+					    (sp_page >= vmas[k].start && sp_page < vmas[k].end)) {
+						entry->excluded = 1;
+					}
+					break;
+				}
+			}
+		}
+	}
+
 	/* Set up the lazy pages context */
 	memset(&lazy_ctx, 0, sizeof(lazy_ctx));
 	lazy_ctx.uffd = uffd;
@@ -2236,6 +2287,7 @@ static int cmd_restore_lazy(pid_t pid)
 	lazy_ctx.buf_size = MAX_VM_REGION_SIZE;
 	lazy_ctx.dump_read = dump_read;
 	lazy_ctx.dump_close = dump_close;
+	strncpy(lazy_ctx.dump_path, path, sizeof(lazy_ctx.dump_path) - 1);
 
 	lazy_ctx.page_buf = malloc(MAX_VM_REGION_SIZE);
 	if (!lazy_ctx.page_buf) {
@@ -2257,10 +2309,35 @@ static int cmd_restore_lazy(pid_t pid)
 	}
 
 	/*
-	 * Don't start the handler thread yet - it will be started
-	 * after ctx_restore in execute_parasite_restore_lazy.
-	 * We need to eagerly serve PC/SP pages first without races.
+	 * Start the lazy-pages handler thread now, before any further
+	 * ptrace-based blob execution (munmap_blob, sigprocmask_blob,
+	 * ctx_restore POKEDATA, etc).
+	 *
+	 * Rationale: those operations poke/peek memory in the target,
+	 * including the injection landing pad at ctx.pc (reused for
+	 * every execute_blob() call). If that landing pad -- or any
+	 * other touched address -- happens to fall within a VMA that
+	 * was registered with the uffd (anon/heap, since checkpoint
+	 * MADV_DONTNEED'd those pages), any access blocks in the kernel
+	 * waiting for a UFFDIO_COPY that will never come unless the
+	 * handler thread is already alive and servicing faults.
+	 *
+	 * PC/SP VMAs are already excluded from uffd registration (see
+	 * setup_target_uffd()), so starting the handler early does not
+	 * race with the later eager restore of those excluded pages --
+	 * the kernel never generates uffd events for unregistered VMAs.
 	 */
+	ret = lazy_pages_start(&lazy_ctx);
+	if (ret) {
+		err("lazy restore: failed to start handler thread\n");
+		free(lazy_ctx.decomp_buf);
+		free(lazy_ctx.page_buf);
+		page_index_destroy(index);
+		close(uffd);
+		dump_close(dump_fd);
+		return -1;
+	}
+	msg("lazy-pages handler thread started (early)\n");
 
 	return 0;
 }
@@ -2459,6 +2536,32 @@ static void *parasite_watch_thread(void *ptr)
 
 	ret = wait4(pid, &status, __WALL, NULL);
 	if (ret != pid) {
+		int saved_errno = errno;
+
+		/*
+		 * The generic SIGCHLD handler (sigchld_handler_service/
+		 * sigchld_handler_worker) can win the race to reap this
+		 * pid's exit status (ptrace tracees are reapable by any
+		 * thread in the tracer process). If that happened, it
+		 * stashed the status for us via parasite_reaped_by_sigchld.
+		 * Poll briefly for it instead of giving up immediately.
+		 */
+		if (saved_errno == ECHILD) {
+			int tries;
+
+			for (tries = 0; tries < 100 && !parasite_reaped_by_sigchld; tries++)
+				usleep(1000); /* 1ms, up to 100ms total */
+
+			if (parasite_reaped_by_sigchld) {
+				status = parasite_reaped_status;
+				parasite_reaped_by_sigchld = 0;
+				log("watch thread: picked up parasite exit status from SIGCHLD handler\n");
+				parasite_status_signal(status);
+				return NULL;
+			}
+		}
+
+		errno = saved_errno;
 		err("wait4() ret %d != parasite %ld, errno %m\n", ret, pid);
 		return NULL;
 	}
@@ -2668,14 +2771,28 @@ static int execute_parasite_restore(pid_t pid)
 		 * Try /proc/pid/mem first (fast), fall back to ptrace
 		 * POKEDATA if /proc/pid/mem is not accessible (e.g. target
 		 * in a different pid/user namespace).
+		 *
+		 * IMPORTANT: the lazy-pages handler thread is already
+		 * running at this point (started earlier in
+		 * cmd_restore_lazy(), before any ptrace blob execution).
+		 * We must NOT reuse lazy_ctx.page_buf or lazy_ctx.dump_fd
+		 * here -- those belong exclusively to the handler thread.
+		 * Concurrent use (shared buffer + shared fd/file-position)
+		 * would race with the handler's own reads and corrupt page
+		 * content. Use an independent buffer and an independently
+		 * opened fd instead.
 		 */
 		{
 			char mem_path[PATH_MAX];
 			int mem_fd = -1;
-			unsigned long pc_page = (unsigned long)ctx.pc & ~((unsigned long)page_size - 1);
-			unsigned long sp_page = (unsigned long)ctx.sp & ~((unsigned long)page_size - 1);
+			int local_dump_fd = -1;
 			int j;
-			char *buf = lazy_ctx.page_buf;
+			char *buf = malloc(MAX_VM_REGION_SIZE);
+
+			if (!buf) {
+				err("lazy restore: malloc failed for eager stack restore buffer\n");
+				return -1;
+			}
 
 			snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
 			mem_fd = open(mem_path, O_WRONLY);
@@ -2684,38 +2801,29 @@ static int execute_parasite_restore(pid_t pid)
 
 			for (j = 0; j < lazy_ctx.index->nr_entries; j++) {
 				struct page_index_entry *entry = &lazy_ctx.index->entries[j];
-				unsigned long entry_start = entry->addr;
-				int in_excluded_vma = 0;
-				int k;
 
-				if (entry->served)
+				if (entry->served || !entry->excluded)
 					continue;
 
-				/* Check if this entry is in an excluded VMA */
-				for (k = 0; k < nr_vmas; k++) {
-					if (vmas[k].flags != FLAG_ANON &&
-					    vmas[k].flags != FLAG_STACK &&
-					    vmas[k].flags != FLAG_HEAP)
-						continue;
-
-					if (entry_start >= vmas[k].start &&
-					    entry_start < vmas[k].end) {
-						if ((pc_page >= vmas[k].start && pc_page < vmas[k].end) ||
-						    (sp_page >= vmas[k].start && sp_page < vmas[k].end)) {
-							in_excluded_vma = 1;
-						}
-						break;
-					}
-				}
-
-				if (in_excluded_vma) {
+				{
 					char *src;
 
 					if (entry->data) {
+						/* Preloaded (encrypted mode): safe, no shared state */
 						src = entry->data;
 					} else {
-						lseek(lazy_ctx.dump_fd, entry->file_offset, SEEK_SET);
-						if (compress_read(buf, entry->len, lazy_ctx.dump_read, lazy_ctx.dump_fd) <= 0)
+						/* Open our own independent fd on first use */
+						if (local_dump_fd < 0) {
+							local_dump_fd = dump_open(lazy_ctx.dump_path, O_RDONLY, 0);
+							if (local_dump_fd < 0) {
+								err("lazy restore: failed to open %s for eager restore: %m\n",
+								    lazy_ctx.dump_path);
+								continue;
+							}
+						}
+
+						lseek(local_dump_fd, entry->file_offset, SEEK_SET);
+						if (compress_read(buf, entry->len, lazy_ctx.dump_read, local_dump_fd) <= 0)
 							continue;
 						src = buf;
 					}
@@ -2733,6 +2841,13 @@ static int execute_parasite_restore(pid_t pid)
 
 			if (mem_fd >= 0)
 				close(mem_fd);
+			if (local_dump_fd >= 0) {
+				if (lazy_ctx.dump_close)
+					lazy_ctx.dump_close(local_dump_fd);
+				else
+					close(local_dump_fd);
+			}
+			free(buf);
 		}
 
 		msg("eager stack restore done\n");
@@ -2747,17 +2862,10 @@ static int execute_parasite_restore(pid_t pid)
 		ctx_restore(pid);
 		msg("ctx_restore done\n");
 
-		/* Now start the lazy-pages handler thread */
-		ret = lazy_pages_start(&lazy_ctx);
-		if (ret) {
-			err("lazy restore: failed to start handler thread\n");
-			return ret;
-		}
-		msg("lazy-pages handler thread started\n");
-
 		/*
-		 * The lazy-pages handler thread is now running.
-		 * It will serve page faults as the process resumes.
+		 * The lazy-pages handler thread was already started earlier
+		 * in cmd_restore_lazy(), before any ptrace blob execution
+		 * that could touch uffd-tracked pages.
 		 */
 		return 0;
 	}
@@ -2814,6 +2922,17 @@ static void sigchld_handler_service(int sig, siginfo_t *sip, void *notused)
 
 	_errno = errno;
 	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+		if (pid == parasite_pid) {
+			/*
+			 * We beat the dedicated parasite_watch_thread to
+			 * reaping this exit status. Stash it via a signal-
+			 * safe side channel so the watcher can pick it up
+			 * on its own wait4() ECHILD instead of hanging.
+			 */
+			parasite_reaped_status = status;
+			parasite_reaped_by_sigchld = 1;
+			continue;
+		}
 		clear_pid_on_worker_exit_non_blocking(pid);
 	}
 
@@ -2827,6 +2946,11 @@ static void sigchld_handler_worker(int signal)
 
 	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
 		log("[%d] SIHCHLD received for %d...\n", getpid(), pid);
+		if (pid == parasite_pid) {
+			parasite_reaped_status = status;
+			parasite_reaped_by_sigchld = 1;
+			continue;
+		}
 	}
 	log("[%d] Tracee killed, worker exit!\n", getpid());
 	exit(0);

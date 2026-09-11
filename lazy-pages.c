@@ -101,7 +101,21 @@ static int handle_page_fault(struct lazy_pages_ctx *ctx, unsigned long fault_add
 	/* Find the region containing this address */
 	entry = page_index_lookup(ctx->index, fault_addr);
 	if (!entry) {
-		err("lazy-pages: no index entry for fault at %lx\n", fault_addr);
+		/*
+		 * No dump data for this address. This is common/expected
+		 * for anonymous memory that was never touched (not
+		 * resident) at checkpoint time -- such pages are
+		 * legitimately zero. Rate-limit logging: a busy app can
+		 * generate thousands of these, which would otherwise
+		 * flood the log (and can evict useful diagnostic context
+		 * on embedded targets with small volatile journals).
+		 */
+		ctx->zero_fallback_count++;
+		if (ctx->zero_fallback_count <= 5 ||
+		    ctx->zero_fallback_count % 500 == 0) {
+			log("lazy-pages: no index entry for fault at %lx (zero-fallback count: %lu)\n",
+			    fault_addr, ctx->zero_fallback_count);
+		}
 		return -1;
 	}
 
@@ -279,8 +293,11 @@ static void *lazy_pages_thread(void *arg)
 					log("lazy-pages: page fault at %lx\n", addr);
 					ret = handle_page_fault(ctx, addr);
 					if (ret < 0) {
-						err("lazy-pages: failed to handle fault at %lx\n",
-						    addr);
+						/*
+						 * handle_page_fault() already rate-limits its
+						 * own logging for the common "no index entry"
+						 * case; avoid double-logging here.
+						 */
 						/*
 						 * We can't leave the thread stuck.
 						 * Try to wake it with a zero page.
@@ -324,8 +341,8 @@ static void *lazy_pages_thread(void *arg)
 		}
 	}
 
-	msg("lazy-pages: handler finished (%lu/%lu pages served)\n",
-	    ctx->index->served_pages, ctx->index->total_pages);
+	msg("lazy-pages: handler finished (%lu/%lu pages served, %lu zero-fallback faults)\n",
+	    ctx->index->served_pages, ctx->index->total_pages, ctx->zero_fallback_count);
 
 	/* Cleanup */
 	close(ctx->uffd);

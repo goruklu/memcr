@@ -20,6 +20,7 @@
 #define __PAGE_INDEX_H__
 
 #include <sys/types.h>
+#include <pthread.h>
 
 struct page_index_entry {
 	unsigned long addr;		/* page-aligned virtual address */
@@ -28,6 +29,14 @@ struct page_index_entry {
 	unsigned long on_disk_len;	/* size of data on disk (compressed or raw) */
 	char *data;			/* preloaded page data (encrypted mode only) */
 	int served;			/* 1 if this region has been served */
+	int excluded;			/* 1 if this region falls within a VMA
+					 * excluded from uffd registration
+					 * (e.g. contains PC/SP). Such entries
+					 * must never be touched by the lazy
+					 * handler (UFFDIO_COPY would fail
+					 * since the range was never
+					 * registered) -- they are restored
+					 * eagerly by the caller instead. */
 };
 
 struct page_index {
@@ -37,6 +46,11 @@ struct page_index {
 	unsigned long total_pages;	/* total number of pages across all entries */
 	unsigned long served_pages;	/* number of pages already served */
 	int preloaded;			/* 1 if data is preloaded in memory */
+	pthread_mutex_t lock;		/* protects served/served_pages updates,
+					 * since the main thread (eager stack
+					 * restore) and the lazy-pages handler
+					 * thread may both call
+					 * page_index_mark_served() concurrently */
 };
 
 struct page_index *page_index_create(void);

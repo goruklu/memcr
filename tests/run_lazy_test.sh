@@ -201,7 +201,9 @@ fi
 echo ""
 echo "${BOLD}--- Encryption + lazy-pages ---${NOFMT}"
 
-if [ -f "$(dirname "$MEMCR")/../libencrypt.so" ]; then
+if [ -n "${LIBENCRYPT_SO:-}" ] && [ -f "$LIBENCRYPT_SO" ]; then
+	LIBENC="$LIBENCRYPT_SO"
+elif [ -f "$(dirname "$MEMCR")/../libencrypt.so" ]; then
 	LIBENC="$(dirname "$MEMCR")/../libencrypt.so"
 elif [ -f "$(dirname "$MEMCR")/libencrypt.so" ]; then
 	LIBENC="$(dirname "$MEMCR")/libencrypt.so"

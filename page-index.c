@@ -49,6 +49,7 @@ struct page_index *page_index_create(void)
 	idx->nr_entries = 0;
 	idx->total_pages = 0;
 	idx->served_pages = 0;
+	pthread_mutex_init(&idx->lock, NULL);
 
 	return idx;
 }
@@ -65,6 +66,7 @@ void page_index_destroy(struct page_index *idx)
 		}
 	}
 
+	pthread_mutex_destroy(&idx->lock);
 	free(idx->entries);
 	free(idx);
 }
@@ -269,7 +271,7 @@ struct page_index_entry *page_index_next_unserved(struct page_index *idx)
 	int i;
 
 	for (i = 0; i < idx->nr_entries; i++) {
-		if (!idx->entries[i].served)
+		if (!idx->entries[i].served && !idx->entries[i].excluded)
 			return &idx->entries[i];
 	}
 	return NULL;
@@ -277,8 +279,10 @@ struct page_index_entry *page_index_next_unserved(struct page_index *idx)
 
 void page_index_mark_served(struct page_index *idx, struct page_index_entry *entry)
 {
+	pthread_mutex_lock(&idx->lock);
 	if (!entry->served) {
 		entry->served = 1;
 		idx->served_pages += entry->len / PAGE_SIZE;
 	}
+	pthread_mutex_unlock(&idx->lock);
 }
