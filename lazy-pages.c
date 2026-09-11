@@ -241,6 +241,7 @@ static void *lazy_pages_thread(void *arg)
 	struct uffd_msg uffd_msg;
 	ssize_t nread;
 	int ret;
+	int poll_timeout = LAZY_PAGES_PREFETCH_TIMEOUT_MS;
 
 	/* Block signals in this thread - let main thread handle them */
 	sigset_t mask;
@@ -261,7 +262,7 @@ static void *lazy_pages_thread(void *arg)
 			break;
 		}
 
-		ret = poll(&pfd, 1, LAZY_PAGES_PREFETCH_TIMEOUT_MS);
+		ret = poll(&pfd, 1, poll_timeout);
 
 		if (ret < 0) {
 			if (errno == EINTR)
@@ -271,6 +272,8 @@ static void *lazy_pages_thread(void *arg)
 		}
 
 		if (ret > 0) {
+			/* Wait for the next fault before returning to prefetching. */
+			poll_timeout = LAZY_PAGES_PREFETCH_TIMEOUT_MS;
 			if (pfd.revents & POLLERR) {
 				err("lazy-pages: POLLERR on uffd\n");
 				break;
@@ -336,8 +339,13 @@ static void *lazy_pages_thread(void *arg)
 				}
 			}
 		} else {
-			/* Timeout: prefetch in background */
+			/*
+			 * Continue prefetching after the target becomes idle. Poll
+			 * without waiting between batches so queued faults still take
+			 * priority, but do not add 100ms per eight fragmented regions.
+			 */
 			prefetch_pages(ctx, LAZY_PAGES_PREFETCH_BATCH);
+			poll_timeout = 0;
 		}
 	}
 

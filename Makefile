@@ -28,7 +28,10 @@ endif
 
 CFLAGS = -Wall -Werror -Wmissing-prototypes
 # memcr CFLAGS
-MCFLAGS = $(CFLAGS) -g
+# page_index_entry contains off_t and is shared by several translation units.
+# Keep off_t 64-bit everywhere, including 32-bit ARM builds, so all users
+# agree on the structure layout and dump-file offsets.
+MCFLAGS = $(CFLAGS) -g -D_FILE_OFFSET_BITS=64
 # parasite CFLAGS
 PCFLAGS = $(CFLAGS)
 
@@ -161,7 +164,7 @@ $(B)/page-index.o: page-index.c page-index.h memcr.h
 $(B)/lazy-pages.o: lazy-pages.c lazy-pages.h page-index.h memcr.h compress.h
 	$(CC) $(MCFLAGS) -c $< -o $@
 
-$(B)/memcr.o: memcr.c $(B)/parasite-blob.h
+$(B)/memcr.o: memcr.c memcr.h lazy-pages.h page-index.h $(B)/parasite-blob.h
 	$(CC) $(MCFLAGS) -DGIT_VERSION='"$(GIT_VERSION)"' -DARCH_NAME='"$(ARCH)"' -I$(B) -c $< -o $@
 
 $(B)/memcr: $(B)/memcr.o $(B)/cpu.o $(B)/enter.o $(B)/compress.o $(B)/page-index.o $(B)/lazy-pages.o
