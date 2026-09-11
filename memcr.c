@@ -2192,7 +2192,9 @@ static int cmd_restore_lazy(pid_t pid)
 	target_mprotect_on(pid);
 
 	/* Tell parasite to exit */
-	target_cmd_end(pid);
+	msg("sending CMD_END to parasite\n");
+	ret = target_cmd_end(pid);
+	msg("target_cmd_end() returned %d\n", ret);
 
 	/* Open dump file for the lazy handler */
 	snprintf(path, sizeof(path), "%s/pages-%d.img", dfl_dump_dir, pid);
@@ -2638,7 +2640,9 @@ static int execute_parasite_restore(pid_t pid)
 		 * In lazy mode, cmd_restore_lazy() already called target_cmd_end()
 		 * to terminate the parasite. Wait for it.
 		 */
+		msg("waiting for parasite to exit\n");
 		parasite_status_wait(&status);
+		msg("parasite_status_wait() returned, status=0x%x\n", status);
 
 		if (WIFSIGNALED(status))
 			return 1;
@@ -2646,12 +2650,14 @@ static int execute_parasite_restore(pid_t pid)
 		assert(WIFEXITED(status) == 1);
 
 		/* munmap parasite_blob area */
+		msg("munmap parasite blob\n");
 		ret = execute_blob(&ctx, munmap_blob, munmap_blob_size,
 				   (unsigned long)ctx.blob, sizeof(parasite_blob));
 		if (ret) {
 			err("munmap blob failed: %ld\n", ret);
 			return ret;
 		}
+		msg("munmap parasite blob done\n");
 
 		/*
 		 * Eagerly restore pages in VMAs that were excluded from uffd
@@ -2729,13 +2735,17 @@ static int execute_parasite_restore(pid_t pid)
 				close(mem_fd);
 		}
 
+		msg("eager stack restore done\n");
+
 		ret = signals_unblock(pid);
 		if (ret) {
 			err("signals_unblock() failed: %ld\n", ret);
 			return ret;
 		}
+		msg("signals unblocked\n");
 
 		ctx_restore(pid);
+		msg("ctx_restore done\n");
 
 		/* Now start the lazy-pages handler thread */
 		ret = lazy_pages_start(&lazy_ctx);
@@ -2743,6 +2753,7 @@ static int execute_parasite_restore(pid_t pid)
 			err("lazy restore: failed to start handler thread\n");
 			return ret;
 		}
+		msg("lazy-pages handler thread started\n");
 
 		/*
 		 * The lazy-pages handler thread is now running.
