@@ -2618,11 +2618,16 @@ static int execute_parasite_restore(pid_t pid)
 		err = cmd_restore_lazy(pid);
 		if (err == -2) {
 			/*
-			 * Lazy restore fell back to eager restore successfully.
-			 * cmd_restore() already handled the full restore path
-			 * including parasite termination, so we're done.
+			 * Lazy restore fell back to eager page upload via
+			 * cmd_restore(), but that function only does the
+			 * page upload + mprotect + CMD_END. The common
+			 * post-restore steps below (parasite wait, munmap,
+			 * signals_unblock, ctx_restore) still need to run --
+			 * skipping ctx_restore() in particular leaves the
+			 * target's PC/SP/code pointing into the parasite
+			 * blob, guaranteeing a crash on resume.
 			 */
-			return 0;
+			goto eager_finish;
 		}
 		if (err) {
 			err("cmd_restore_lazy() failed: %d\n", err);
@@ -2752,6 +2757,7 @@ static int execute_parasite_restore(pid_t pid)
 		return err;
 	}
 
+eager_finish:
 	parasite_status_wait(&status);
 
 	/* parasite was terminated by a signal */
