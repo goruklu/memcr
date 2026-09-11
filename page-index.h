@@ -46,6 +46,7 @@ struct page_index {
 	unsigned long total_pages;	/* total number of pages across all entries */
 	unsigned long served_pages;	/* number of pages already served */
 	int preloaded;			/* 1 if data is preloaded in memory */
+	int prefetch_cursor;		/* next address-ordered entry to consider */
 	pthread_mutex_t lock;		/* protects served/served_pages updates,
 					 * since the main thread (eager stack
 					 * restore) and the lazy-pages handler

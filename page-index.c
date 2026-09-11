@@ -49,6 +49,7 @@ struct page_index *page_index_create(void)
 	idx->nr_entries = 0;
 	idx->total_pages = 0;
 	idx->served_pages = 0;
+	idx->prefetch_cursor = 0;
 	pthread_mutex_init(&idx->lock, NULL);
 
 	return idx;
@@ -264,16 +265,19 @@ struct page_index_entry *page_index_lookup(struct page_index *idx, unsigned long
 
 /*
  * Find the next unserved entry for background prefetching.
- * Simple linear scan from the beginning.
+ * Entries are address-sorted and each is considered only once, avoiding a
+ * repeated scan from the start for large, fragmented restore images.
  */
 struct page_index_entry *page_index_next_unserved(struct page_index *idx)
 {
-	int i;
+	while (idx->prefetch_cursor < idx->nr_entries) {
+		struct page_index_entry *entry =
+			&idx->entries[idx->prefetch_cursor++];
 
-	for (i = 0; i < idx->nr_entries; i++) {
-		if (!idx->entries[i].served && !idx->entries[i].excluded)
-			return &idx->entries[i];
+		if (!entry->served && !entry->excluded)
+			return entry;
 	}
+
 	return NULL;
 }
 
