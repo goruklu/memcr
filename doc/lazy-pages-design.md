@@ -71,14 +71,14 @@ memcr -l 9000 --lazy-pages
 |  | execute_parasite  |                 |                      |
 |  | _restore (lazy)   |                 |                      |
 |  |                   |                 |                      |
+|  | - start handler   |                 |                      |
 |  | - mprotect_on     |                 |                      |
 |  | - CMD_END         |                 |                      |
-|  | - eager stack     |                 |                      |
+|  | - eager excluded  |                 |                      |
 |  |   restore via     |                 |                      |
 |  |   /proc/pid/mem   |                 |                      |
 |  | - ctx_restore     |                 |                      |
 |  | - unseize         |                 |                      |
-|  | - start handler --+-----------------+                      |
 |  +-------------------+                                       |
 +--------------------------------------------------------------+
          ^                            |
@@ -101,8 +101,9 @@ memcr -l 9000 --lazy-pages
 |  |(eager) | | FAULT! | |(prefet)| | FAULT! | |(prefet)|    |
 |  +--------+ +--------+ +--------+ +--------+ +--------+     |
 |                                                              |
-|  Stack VMA: excluded from uffd, eagerly restored              |
-|  Other VMAs: registered with UFFDIO_REGISTER (MODE_MISSING)   |
+|  Stack/PC VMAs: excluded from uffd, eagerly restored          |
+|  Other eligible VMAs: registered with UFFDIO_REGISTER         |
+|  (MODE_MISSING)                                               |
 +--------------------------------------------------------------+
 ```
 
@@ -153,18 +154,24 @@ RESTORE (with --lazy-pages):
    15. Build page_index from dump file:
        - Non-encrypted: record file offsets for lseek+read later
        - Encrypted: read+decrypt+decompress all data into memory (preload)
-   16. Set up lazy_pages_ctx (buffers, function pointers)
+    16. Mark page-index entries in PC/SP VMAs as excluded from prefetch.
+    17. Set up lazy_pages_ctx (buffers, dump path, function pointers)
+    18. lazy_pages_start() -> spawn handler thread before any further
+        ptrace/blob work. This prevents a deadlock if that work accesses a
+        discarded page in a uffd-registered VMA.
 
-  execute_parasite_restore():
-   17. parasite_status_wait() -> wait for parasite to exit
-   18. munmap parasite_blob area
-   19. Eagerly restore excluded VMA pages via /proc/pid/mem:
-       - Read page data from index (preloaded or from dump file)
-       - pwrite() directly into target's address space
-   20. signals_unblock()
-   21. ctx_restore() -> restore original code and stack via ptrace
-   22. lazy_pages_start() -> spawn handler thread
-   23. unseize_target() -> PROCESS RESUMES IMMEDIATELY
+   execute_parasite_restore():
+    19. parasite_status_wait() -> wait for parasite to exit
+    20. munmap parasite_blob area
+    21. Eagerly restore PC/SP-excluded VMA pages via /proc/pid/mem:
+        - Read preloaded data or use a separate dump fd and buffer
+        - The handler owns its own dump fd and buffers; sharing either would
+          race with its asynchronous reads and could restore corrupt data
+        - pwrite() directly into target's address space
+        - Fall back to ptrace POKEDATA when /proc/<pid>/mem is unavailable
+    22. signals_unblock()
+    23. ctx_restore() -> restore original code and stack via ptrace
+    24. unseize_target() -> PROCESS RESUMES IMMEDIATELY
 
 LAZY-PAGES HANDLER THREAD (runs asynchronously):
   loop:
@@ -172,7 +179,10 @@ LAZY-PAGES HANDLER THREAD (runs asynchronously):
     if page fault received:
       addr = fault_address & PAGE_MASK
       entry = page_index_lookup(addr)
-      if entry->data (preloaded):
+      if no entry:
+        UFFDIO_ZEROPAGE to unblock the faulting thread
+        count a zero fallback; log the first five, then every 500th
+      else if entry->data (preloaded):
         copy from memory
       else:
         lseek + compress_read from dump file
@@ -201,15 +211,16 @@ standard eager restore automatically:
    for the `CMD_SET_PAGES` eager restore fallback
 4. `cmd_restore_lazy()` detects the failure and calls `cmd_restore()` instead
 5. Returns a special code (`-2`) to `execute_parasite_restore()`
-6. `execute_parasite_restore()` recognizes the eager fallback code and returns
-   immediately, skipping the lazy-pages post-processing path (parasite wait,
-   munmap, `/proc/pid/mem` eager stack restore, handler thread start)
+6. `execute_parasite_restore()` recognizes the eager fallback code and enters
+   the shared eager completion path, including parasite wait, blob unmap,
+   signal restoration, and `ctx_restore()`
 
 This ensures:
 - No parasite crash (no `__builtin_trap()` / SIGILL)
 - The parasite remains alive for the eager `CMD_SET_PAGES` path
 - The eager restore completes the full lifecycle including parasite termination
-- No stale lazy context is accessed
+- The target PC, stack pointer, and overwritten code are restored before it
+  resumes
 
 If uffd creation succeeds but `UFFDIO_REGISTER` fails in the parasite, the
 parasite drains the VMA list (keeps protocol in sync), sends a failure status
@@ -231,8 +242,10 @@ because:
 2. Ptrace cannot resolve userfaultfd-registered faults on a stopped process
 3. The stack must be fully present when the process resumes execution
 
-These excluded VMAs are instead restored eagerly via `/proc/<pid>/mem` using
-`pwrite()` before `ctx_restore()` runs.
+Index entries in these excluded VMAs are marked `excluded`, so the handler's
+background prefetch skips them. They are restored eagerly via `/proc/<pid>/mem`
+using `pwrite()` before `ctx_restore()` runs, with `PTRACE_POKEDATA` as the
+fallback when `/proc/<pid>/mem` is unavailable.
 
 ### Socket Blocking for SCM_RIGHTS
 
@@ -241,15 +254,40 @@ protocol. When receiving the uffd from the parasite via `recvmsg(SCM_RIGHTS)`
 and reading the parasite's status response, the daemon switches the socket to
 blocking mode (`fcntl(F_SETFL, ~O_NONBLOCK)`).
 
-### Handler Thread Lifecycle
+### Handler Thread Lifecycle and I/O Ownership
 
-The handler thread is started **after** `ctx_restore()` completes, not before.
-This avoids races between:
-- The handler seeking/reading the dump file
-- The main thread reading from the same file for eager stack restore
+The handler thread starts **before** waiting for the parasite and before later
+ptrace/blob operations. Those operations can touch discarded pages in a
+registered VMA; starting the handler first ensures it can resolve the resulting
+userfaultfd event instead of leaving the target blocked.
+
+The handler exclusively owns `lazy_ctx.dump_fd`, `page_buf`, and `decomp_buf`.
+The eager restore of excluded VMAs uses a separate buffer and independently
+opens the dump file when data was not preloaded. This permits early handler
+startup without sharing a file position or buffer between threads.
 
 The thread is detached (`pthread_detach`) and the main thread polls
 `lazy_ctx.active` to wait for completion in interactive and service modes.
+
+### Page-Index Synchronization and Zero Fallbacks
+
+The handler thread and the eager excluded-VMA restore can both mark indexed
+regions served. `page_index_mark_served()` serializes updates to `served` and
+`served_pages` with a mutex.
+
+A fault address with no page-index entry cannot be restored from the dump.
+Memcr supplies a zero page with `UFFDIO_ZEROPAGE` to release the faulting
+thread. This commonly represents anonymous memory that was never resident at
+checkpoint time and was therefore correctly absent from the dump. The handler
+counts these zero fallbacks, logs the first five and each 500th thereafter, and
+includes the total in its completion message. High counts should be correlated
+with application behavior before being treated as missing checkpoint data.
+
+### Parasite Exit Reaping
+
+The generic SIGCHLD handlers can reap the parasite before the dedicated watcher
+calls `wait4()`. When this race produces `ECHILD`, the watcher consumes the
+status saved by the signal handler and signals normal restore completion.
 
 ---
 

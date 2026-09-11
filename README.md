@@ -106,10 +106,24 @@ This reduces the time the target process is frozen during restore -- only the ch
 
 How it works:
 1. During restore, a parasite running inside the target creates a `userfaultfd`, registers eligible VMAs (anonymous private mappings) for missing-page fault tracking via `UFFDIO_REGISTER`, and sends the uffd to the daemon via `SCM_RIGHTS`
-2. Stack and instruction pointer VMAs are excluded from uffd and restored eagerly (required for correct process resumption)
-3. The process resumes immediately
-4. A handler thread in the daemon polls the uffd for page faults, reads the corresponding page data from the dump file, and injects it via `UFFDIO_COPY`
-5. Idle time is used to prefetch remaining pages in the background
+2. VMAs containing the saved stack or instruction pointer are excluded from
+   userfaultfd and restored eagerly, which is required for correct process
+   resumption.
+3. The daemon starts its handler thread before subsequent ptrace operations.
+   Those operations can touch pages in registered VMAs and would otherwise
+   deadlock waiting for a handler that has not started.
+4. The process resumes immediately after its context has been restored.
+5. The handler polls the uffd for page faults, reads the corresponding page
+   data from the dump file, and injects it with `UFFDIO_COPY`.
+6. Idle time is used to prefetch remaining eligible pages in the background.
+
+If a fault has no matching page-index entry, memcr resolves it with a
+zero-filled page so the target is not left blocked. This is normally expected
+for anonymous pages that were not resident when checkpointed. The handler logs
+the first five such faults and then every 500th, and reports their total as
+`zero-fallback faults` in its completion message. A nonzero count does not by
+itself indicate data loss, but a large count for a workload that expects those
+pages to retain data warrants investigation.
 
 If `userfaultfd` is not available (kernel lacks `CONFIG_USERFAULTFD`), memcr automatically falls back to eager restore.
 
